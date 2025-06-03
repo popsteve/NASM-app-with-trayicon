@@ -1,0 +1,10 @@
+#include "resource.h"
+
+// Menu resource
+MAIN_MENU MENU
+BEGIN
+    POPUP ""  // 空标题的弹出菜单
+    BEGIN
+        MENUITEM "E&xit",    40001
+    END
+END 
