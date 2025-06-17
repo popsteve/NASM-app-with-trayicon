@@ -24,6 +24,13 @@ WM_USER             EQU 0400h
 WM_TRAYICON_MSG     EQU WM_USER + 1               ; Our custom tray icon message
 WM_LBUTTONDOWN      EQU 0201h
 WM_RBUTTONDOWN      EQU 0204h
+WM_COMMAND          EQU 0111h                     ; Message for menu clicks
+IDR_MYMENU          EQU 101                       ; Menu resource ID (example)
+IDM_SHOW            EQU 102                       ; Menu item ID: Show (example)
+IDM_EXIT            EQU 103                       ; Menu item ID: Exit (example)
+TPM_LEFTALIGN       EQU 0
+TPM_RIGHTBUTTON     EQU 2
+TPM_RETURNCMD       EQU 100h
 
 WindowWidth         EQU 640
 WindowHeight        EQU 480
@@ -37,6 +44,7 @@ extern GetModuleHandleA
 extern IsDialogMessageA
 extern LoadImageA
 extern PostQuitMessage
+extern PostMessageA
 extern RegisterClassExA
 extern ShowWindow
 extern TranslateMessage
@@ -45,6 +53,14 @@ extern BeginPaint
 extern EndPaint
 extern Ellipse
 extern Shell_NotifyIconA
+extern LoadMenuA
+extern GetSubMenu
+extern TrackPopupMenuEx
+extern TrackPopupMenu
+extern SetForegroundWindow
+extern GetCursorPos
+extern DestroyMenu
+extern IsWindowVisible
 
 global Start                                    ; Export symbols. The entry point
 
@@ -57,15 +73,33 @@ section .data                                   ; Initialized data segment
 section .bss                                    ; Uninitialized data segment
  alignb 8
  hInstance resq 1
+ hMenu     resq 1                               ; Handle for the loaded menu
+ pt        resq 1                               ; POINT structure for GetCursorPos (x, y as LONGs)
 
 section .text                                   ; Code segment
 Start:
  sub   RSP, 8                                   ; Align stack pointer to 16 bytes
 
- sub   RSP, 32                                  ; 32 bytes of shadow space
- xor   ECX, ECX
+ ; Load Menu
+ sub   RSP, 32                                  ; Shadow space
+ xor   ECX, ECX                                 ; ECX = NULL for GetModuleHandleA(NULL)
  call  GetModuleHandleA
  mov   qword [REL hInstance], RAX
+ mov   RCX, RAX                                 ; RCX = hInstance
+ mov   EDX, IDR_MYMENU                          ; RDX = Menu resource name/ID
+ call  LoadMenuA
+ mov   qword [REL hMenu], RAX                   ; Store hMenu
+ test  RAX, RAX                                 ; Check if LoadMenuA failed
+ jnz   .LoadMenuOK
+ mov   ECX, 97                                  ; Error code for menu load failure
+ call  ExitProcess                              ; Exit if menu failed to load
+.LoadMenuOK:
+ add   RSP, 32                                  ; Remove shadow space
+
+ sub   RSP, 32                                  ; 32 bytes of shadow space for the original GetModuleHandleA call
+ xor   ECX, ECX
+ call  GetModuleHandleA
+ mov   qword [REL hInstance], RAX               ; This GetModuleHandle is actually for WNDCLASSEX.hInstance, ensure it's correct.
  add   RSP, 32                                  ; Remove the 32 bytes
 
  call  WinMain
@@ -218,8 +252,8 @@ WinMain:
  mov   RAX, qword [hWnd]                      ; Main window handle from [RBP - 8]
  mov   qword [nid.hWnd], RAX
  mov   dword [nid.uID], 0                     ; Icon ID
- mov   dword [nid.uFlags], NIF_ICON           ; Test: Only NIF_ICON
- mov   dword [nid.uCallbackMessage], WM_TRAYICON_MSG ; Still set it, though NIF_MESSAGE is off
+ mov   dword [nid.uFlags], NIF_ICON | NIF_MESSAGE | NIF_TIP ; Restore NIF_MESSAGE and NIF_TIP
+ mov   dword [nid.uCallbackMessage], WM_TRAYICON_MSG
  mov   RAX, qword [wc.hIconSm]                ; Small icon handle from [RBP - 64]
  mov   qword [nid.hIcon], RAX
 
@@ -316,6 +350,9 @@ WndProc:
     cmp   RDX, WM_TRAYICON_MSG
     je    WMTRAYICON
 
+    cmp   RDX, WM_COMMAND
+    je    WCOMMANDHANDLER
+
 DefaultMessage:
     sub   RSP, 32                  ; 32 bytes of shadow space (for DefWindowProcA)
     mov   RCX, qword [RBP + 16]    ; hWnd
@@ -344,10 +381,61 @@ WMTRAYICON:                        ; Handler for our tray icon message
 
 .TrayLeftClick:
     ; TODO: Implement left-click action (e.g., show/hide window)
+    ; For now, let's make left-click show the window if it's hidden or bring to front
+    mov   RCX, qword [RBP + 16] ; hWnd
+    call  IsWindowVisible
+    test  RAX, RAX
+    jnz   .BringToFront     ; If visible, just bring to front
+    ; If not visible, show it
+    mov   RCX, qword [RBP + 16] ; hWnd
+    mov   EDX, SW_SHOWNORMAL
+    call  ShowWindow
+.BringToFront:
+    mov   RCX, qword [RBP + 16] ; hWnd
+    call  SetForegroundWindow
     jmp   .TrayHandled
 
 .TrayRightClick:
-    ; TODO: Implement right-click action (e.g., show context menu)
+    ; Get the cursor position first
+    sub   RSP, 32                      ; Shadow space for GetCursorPos
+    lea   RCX, [REL pt]                ; RCX = address of POINT structure
+    call  GetCursorPos
+    add   RSP, 32                      ; Clean up shadow space
+
+    ; To display a menu for a notification icon, the application must make its window the foreground window
+    mov   RCX, qword [RBP + 16]        ; RCX = hWnd
+    call  SetForegroundWindow
+
+    ; --- Get the submenu handle ---
+    ; Load the main menu bar handle into RCX
+    mov   RCX, qword [REL hMenu]
+    test  RCX, RCX
+    jz    .TrayHandled                 ; Exit if menu handle is null
+
+    ; Get the first (and only) submenu from the menu bar
+    sub   RSP, 32                      ; Reserve shadow space for GetSubMenu
+    mov   EDX, 0                       ; EDX = uIndex of the submenu
+    call  GetSubMenu                   ; Returns submenu handle in RAX
+    add   RSP, 32                      ; Clean up shadow space
+
+    ; Check if GetSubMenu returned a valid handle
+    test  RAX, RAX
+    jz    .TrayHandled                 ; Exit if it failed
+
+    ; --- Display the popup menu ---
+    ; Now RAX holds the handle to the actual popup menu we want to show
+    mov   RCX, RAX                     ; RCX = hSubMenu
+    mov   EDX, TPM_LEFTALIGN | TPM_RIGHTBUTTON ; RDX = Flags
+    mov   R8D, dword [REL pt]          ; R8D = pt.x
+    mov   R9D, dword [REL pt + 4]      ; R9D = pt.y
+    
+    sub   RSP, 48                      ; 32 shadow + 16 for two 8-byte params
+    mov   RAX, qword [RBP + 16]        ; Load hWnd into RAX first
+    mov   qword [RSP + 32], RAX        ; Param 5: HWND to post messages to
+    mov   qword [RSP + 40], NULL       ; Param 6: Reserved, must be NULL
+    call  TrackPopupMenuEx
+    add   RSP, 48                      ; Clean up stack
+
     jmp   .TrayHandled
 
 .TrayUnhandled:
@@ -358,7 +446,61 @@ WMTRAYICON:                        ; Handler for our tray icon message
     pop   RBP
     ret
 
+WCOMMANDHANDLER:                       ; Handles WM_COMMAND messages
+    ; RBP + 16 = hWnd
+    ; RBP + 24 = uMsg (WM_COMMAND)
+    ; RBP + 32 = wParam (HIWORD: notification code, LOWORD: item ID/control ID)
+    ; RBP + 40 = lParam (control handle or 0)
+
+    mov   RAX, qword [RBP + 32]    ; RAX = wParam
+    movzx EAX, AX                  ; EAX = LOWORD(wParam) = Menu Item ID
+
+    cmp   EAX, IDM_SHOW
+    je    .MenuShow
+    cmp   EAX, IDM_EXIT
+    je    .MenuExit
+    jmp   .MenuUnhandled
+
+.MenuShow:
+    mov   RCX, qword [RBP + 16]    ; hWnd
+    call  IsWindowVisible
+    test  RAX, RAX
+    jnz   .MenuShowBringToFront
+    ; If not visible, show it
+    mov   RCX, qword [RBP + 16]    ; hWnd
+    mov   EDX, SW_SHOWNORMAL
+    call  ShowWindow
+.MenuShowBringToFront:
+    mov   RCX, qword [RBP + 16]    ; hWnd
+    call  SetForegroundWindow
+    jmp   .MenuHandled
+
+.MenuExit:
+    sub   RSP, 32                  ; Shadow space for PostQuitMessage
+    xor   ECX, ECX                 ; ECX = nExitCode (0)
+    call  PostQuitMessage
+    add   RSP, 32
+    jmp   .MenuHandled
+
+.MenuUnhandled:
+    ; If not one of our menu items, could be from a control, or unhandled.
+    ; For now, just fall through to returning 0, as if handled.
+.MenuHandled:
+    xor   EAX, EAX                 ; Return 0, indicating message was handled
+    mov   RSP, RBP
+    pop   RBP
+    ret
+
 WMDESTROY:
+    ; Destroy Menu if loaded
+    mov   RCX, qword [REL hMenu]
+    test  RCX, RCX
+    jz    .SkipDestroyMenu
+    sub   RSP, 32                  ; Shadow space for DestroyMenu
+    call  DestroyMenu
+    add   RSP, 32
+.SkipDestroyMenu:
+
     ; Remove tray icon before exiting
     mov   dword [temp_nid.cbSize], 168
     mov   RAX, qword [RBP + 16]        ; hWnd from WndProc's argument

@@ -1,10 +1,10 @@
-#include "resource.h"
-
-// Menu resource
-MAIN_MENU MENU
-BEGIN
-    POPUP ""  // 空标题的弹出菜单
-    BEGIN
-        MENUITEM "E&xit",    40001
-    END
-END 
+// Menu resource definition  
+101 MENU DISCARDABLE
+{
+    POPUP "&Action"
+    {
+        MENUITEM "&Show Window", 102
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit", 103
+    }
+} 
