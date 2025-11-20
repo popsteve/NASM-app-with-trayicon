@@ -8,6 +8,7 @@ IDI_APPLICATION     EQU 7F00h
 IMAGE_CURSOR        EQU 2
 IMAGE_ICON          EQU 1
 LR_SHARED           EQU 8000h
+LR_LOADFROMFILE     EQU 10h
 NULL                EQU 0
 SW_SHOWNORMAL       EQU 1
 WM_DESTROY          EQU 2
@@ -28,9 +29,15 @@ WM_COMMAND          EQU 0111h                     ; Message for menu clicks
 IDR_MYMENU          EQU 101                       ; Menu resource ID (example)
 IDM_SHOW            EQU 102                       ; Menu item ID: Show (example)
 IDM_EXIT            EQU 103                       ; Menu item ID: Exit (example)
+IDI_MYICON          EQU 201                       ; Custom icon resource ID
 TPM_LEFTALIGN       EQU 0
 TPM_RIGHTBUTTON     EQU 2
 TPM_RETURNCMD       EQU 100h
+WM_TIMER            EQU 0113h
+DT_CENTER           EQU 1
+DT_VCENTER          EQU 4
+DT_SINGLELINE       EQU 20h
+
 
 WindowWidth         EQU 640
 WindowHeight        EQU 480
@@ -61,6 +68,15 @@ extern SetForegroundWindow
 extern GetCursorPos
 extern DestroyMenu
 extern IsWindowVisible
+extern MoveToEx
+extern LineTo
+extern GetClientRect                            ; ADDED: To get runtime window dimensions
+extern SetTimer
+extern KillTimer
+extern GetLocalTime
+extern InvalidateRect
+extern DrawTextA
+extern MessageBeep
 
 global Start                                    ; Export symbols. The entry point
 
@@ -69,12 +85,17 @@ section .data                                   ; Initialized data segment
  ClassName   db "Window", 0
  TrayToolTip db "My Tray Application", 0
  PAINTSTRUCT_SIZE EQU 72
+ LogoPath    db "logo.ico", 0
+ TimeString  db "00:00:00", 0
+ TimeFormat  db "%02d:%02d:%02d", 0
 
 section .bss                                    ; Uninitialized data segment
  alignb 8
  hInstance resq 1
  hMenu     resq 1                               ; Handle for the loaded menu
  pt        resq 1                               ; POINT structure for GetCursorPos (x, y as LONGs)
+ SystemTime resb 16                             ; SYSTEMTIME structure
+
 
 section .text                                   ; Code segment
 Start:
@@ -160,13 +181,24 @@ WinMain:
  mov   qword [wc.hInstance], RAX                ; [RBP - 112]
 
  sub   RSP, 32 + 16                             ; Shadow space + 2 parameters
+ xor   ECX, ECX                                 ; ECX = NULL
+ lea   RDX, [REL LogoPath]                      ; RDX = Path to logo.ico
+ mov   R8D, IMAGE_ICON
+ xor   R9D, R9D
+ mov   qword [RSP + 4 * 8], NULL
+ mov   qword [RSP + 5 * 8], LR_LOADFROMFILE
+ call  LoadImageA                               ; Large program icon
+ test  RAX, RAX                                 ; Check if custom icon loaded
+ jnz   .CustomIconLoaded1                       ; If loaded, use it
+ ; Fallback to system icon
  xor   ECX, ECX
  mov   EDX, IDI_APPLICATION
  mov   R8D, IMAGE_ICON
  xor   R9D, R9D
  mov   qword [RSP + 4 * 8], NULL
  mov   qword [RSP + 5 * 8], LR_SHARED
- call  LoadImageA                               ; Large program icon
+ call  LoadImageA
+.CustomIconLoaded1:
  mov   qword [wc.hIcon], RAX                    ; [RBP - 104]
  add   RSP, 48                                  ; Remove the 48 bytes
 
@@ -187,13 +219,24 @@ WinMain:
  mov   qword [wc.lpszClassName], RAX            ; [RBP - 72]
 
  sub   RSP, 32 + 16                             ; Shadow space + 2 parameters
+ xor   ECX, ECX                                 ; ECX = NULL
+ lea   RDX, [REL LogoPath]                      ; RDX = Path to logo.ico
+ mov   R8D, IMAGE_ICON
+ xor   R9D, R9D
+ mov   qword [RSP + 4 * 8], NULL
+ mov   qword [RSP + 5 * 8], LR_LOADFROMFILE
+ call  LoadImageA                               ; Small program icon
+ test  RAX, RAX                                 ; Check if custom icon loaded
+ jnz   .CustomIconLoaded2                       ; If loaded, use it
+ ; Fallback to system icon
  xor   ECX, ECX
  mov   EDX, IDI_APPLICATION
  mov   R8D, IMAGE_ICON
  xor   R9D, R9D
  mov   qword [RSP + 4 * 8], NULL
  mov   qword [RSP + 5 * 8], LR_SHARED
- call  LoadImageA                               ; Small program icon
+ call  LoadImageA
+.CustomIconLoaded2:
  mov   qword [wc.hIconSm], RAX                  ; [RBP - 64]
  test  RAX, RAX                                 ; Check if LoadImageA for hIconSm failed
  jnz   .LoadIconSmOK                            ; If not zero (success), continue
@@ -232,7 +275,7 @@ WinMain:
 
  sub   RSP, 32                                  ; 32 bytes of shadow space
  mov   RCX, qword [hWnd]                        ; [RBP - 8]
- mov   EDX, SW_SHOWNORMAL
+ xor   EDX, EDX                                 ; SW_HIDE = 0
  call  ShowWindow
  add   RSP, 32                                  ; Remove the 32 bytes
 
@@ -240,6 +283,16 @@ WinMain:
  mov   RCX, qword [hWnd]                        ; [RBP - 8]
  call  UpdateWindow
  add   RSP, 32                                  ; Remove the 32 bytes
+
+ ; Start Timer
+ sub   RSP, 32 + 16
+ mov   RCX, qword [hWnd]
+ mov   RDX, 1                                   ; IDEvent = 1
+ mov   R8, 1000                                 ; Elapse = 1000 ms
+ mov   R9, NULL
+ call  SetTimer
+ add   RSP, 48
+
 
  ; Zero out the NOTIFYICONDATA structure before use for NIM_ADD
  lea   RDI, [nid]                             ; RDI = address of nid
@@ -331,11 +384,23 @@ WndProc:
     mov   RBP, RSP
     sub   RSP, 208 ; Shadow space (32) + NOTIFYICONDATA (168) = 200, rounded up to 208 bytes (16-byte aligned)
 
-    ; Stack layout for NOTIFYICONDATA in WndProc (used for NIM_DELETE)
+    ; Stack layout
     %define temp_nid           RBP - 208
-    %define temp_nid.cbSize    RBP - 208            ; DWORD (4 bytes)
-    %define temp_nid.hWnd      RBP - 200            ; HWND (8 bytes)
-    %define temp_nid.uID       RBP - 192            ; UINT (4 bytes)
+    %define temp_nid.cbSize    RBP - 208
+    %define temp_nid.hWnd      RBP - 200
+    %define temp_nid.uID       RBP - 192
+    %define ps                 RBP - 120 ; PAINTSTRUCT (72 bytes)
+    %define hdc                RBP - 48  ; HDC (8 bytes)
+    %define rect               RBP - 144 ; MODIFIED: RECT structure (16 bytes)
+    %define rect.left          RBP - 144
+    %define rect.top           RBP - 140
+    %define rect.right         RBP - 136
+    %define rect.bottom        RBP - 132
+    %define CenterX            RBP - 148
+    %define CenterY            RBP - 152
+    %define Radius             RBP - 156
+    %define HandX              RBP - 160
+    %define HandY              RBP - 164
 
     ; Save parameters (passed in RCX, RDX, R8, R9)
     mov   qword [RBP + 16], RCX    ; hWnd
@@ -347,11 +412,17 @@ WndProc:
     cmp   RDX, WM_DESTROY
     je    WMDESTROY
 
+    cmp   RDX, WM_PAINT
+    je    WMPAINT
+
     cmp   RDX, WM_TRAYICON_MSG
     je    WMTRAYICON
 
     cmp   RDX, WM_COMMAND
     je    WCOMMANDHANDLER
+
+    cmp   RDX, WM_TIMER
+    je    WMTIMER
 
 DefaultMessage:
     sub   RSP, 32                  ; 32 bytes of shadow space (for DefWindowProcA)
@@ -366,12 +437,249 @@ DefaultMessage:
     pop   RBP
     ret
 
-WMTRAYICON:                        ; Handler for our tray icon message
-    ; RBP + 16 = hWnd
-    ; RBP + 24 = uMsg (WM_TRAYICON_MSG)
-    ; RBP + 32 = wParam (uID of icon = 0)
-    ; RBP + 40 = lParam (mouse message, e.g., WM_LBUTTONDOWN)
+WMPAINT:
+    ; Call BeginPaint
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]    ; hWnd
+    lea   RDX, [ps]                ; Address of PAINTSTRUCT
+    call  BeginPaint
+    mov   qword [hdc], RAX         ; Save HDC
+    add   RSP, 32
 
+    ; Get Client Rect
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]
+    lea   RDX, [rect]
+    call  GetClientRect
+    add   RSP, 32
+
+    ; Calculate Center and Radius
+    ; CenterX = rect.right / 2
+    mov   EAX, dword [rect.right]
+    shr   EAX, 1
+    mov   dword [CenterX], EAX
+
+    ; CenterY = rect.bottom / 2
+    mov   EAX, dword [rect.bottom]
+    shr   EAX, 1
+    mov   dword [CenterY], EAX
+
+    ; Radius = min(CenterX, CenterY) - 10
+    mov   ECX, dword [CenterX]
+    cmp   ECX, dword [CenterY]
+    cmovg ECX, dword [CenterY]     ; ECX = min(CenterX, CenterY)
+    sub   ECX, 10
+    mov   dword [Radius], ECX
+
+    ; Draw Clock Face (Ellipse)
+    sub   RSP, 48                  ; Shadow (32) + 5th param (8) + alignment
+    mov   RCX, qword [hdc]
+    
+    mov   EDX, dword [CenterX]
+    sub   EDX, dword [Radius]      ; Left
+    
+    mov   R8D, dword [CenterY]
+    sub   R8D, dword [Radius]      ; Top
+    
+    mov   R9D, dword [CenterX]
+    add   R9D, dword [Radius]      ; Right
+    
+    mov   EAX, dword [CenterY]
+    add   EAX, dword [Radius]      ; Bottom
+    mov   qword [RSP + 32], RAX    ; 5th param
+    
+    call  Ellipse
+    add   RSP, 48
+
+    ; Get Time
+    sub   RSP, 32
+    lea   RCX, [REL SystemTime]
+    call  GetLocalTime
+    add   RSP, 32
+
+    ; ---------------------------------------------------------
+    ; Draw Second Hand
+    ; ---------------------------------------------------------
+    ; Angle = Second * PI / 30
+    fild  word [REL SystemTime + 12] ; Load Second
+    fldpi                            ; Load PI
+    fmulp                            ; S * PI
+    mov   dword [HandX], 30          ; Use HandX as temp for 30
+    fidiv dword [HandX]              ; (S * PI) / 30
+    
+    fsincos                          ; st0 = cos, st1 = sin
+    
+    ; Calculate Target X: CenterX + (Radius * 0.9) * sin(Angle)
+    fld   st1                        ; Copy sin
+    fild  dword [Radius]
+    mov   dword [HandX], 9
+    fimul dword [HandX]
+    mov   dword [HandX], 10
+    fidiv dword [HandX]              ; Radius * 0.9
+    
+    fmulp                            ; (Radius*0.9) * sin
+    fiadd dword [CenterX]
+    fistp dword [HandX]              ; Store X
+    
+    ; Calculate Target Y: CenterY - (Radius * 0.9) * cos(Angle)
+    ; st0 is now cos
+    fild  dword [Radius]
+    mov   dword [HandY], 9
+    fimul dword [HandY]
+    mov   dword [HandY], 10
+    fidiv dword [HandY]              ; Radius * 0.9
+    
+    fmulp                            ; (Radius*0.9) * cos
+    fchs                             ; Negate
+    fiadd dword [CenterY]
+    fistp dword [HandY]              ; Store Y
+    
+    fstp  st0                        ; Pop sin (st0 was cos, popped by fistp? No wait)
+                                     ; Stack track:
+                                     ; Start: [Cos, Sin]
+                                     ; X calc: Pushed Sin, Radius... Popped all. Stack: [Cos, Sin]
+                                     ; Y calc: Pushed Radius... Popped all. Stack: [Sin] (Because Cos was popped by fistp)
+                                     ; So st0 is Sin.
+    fstp st0                         ; Empty stack
+    
+    ; Draw Line
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [CenterX]
+    mov   R8D, dword [CenterY]
+    mov   R9, NULL
+    call  MoveToEx
+    add   RSP, 32
+    
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [HandX]
+    mov   R8D, dword [HandY]
+    call  LineTo
+    add   RSP, 32
+
+    ; ---------------------------------------------------------
+    ; Draw Minute Hand
+    ; ---------------------------------------------------------
+    ; Angle = Minute * PI / 30
+    fild  word [REL SystemTime + 10] ; Load Minute
+    fldpi
+    fmulp
+    mov   dword [HandX], 30
+    fidiv dword [HandX]
+    fsincos
+    
+    ; X: CenterX + (Radius * 0.8) * sin
+    fld   st1
+    fild  dword [Radius]
+    mov   dword [HandX], 8
+    fimul dword [HandX]
+    mov   dword [HandX], 10
+    fidiv dword [HandX]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [HandX]
+    
+    ; Y: CenterY - (Radius * 0.8) * cos
+    fild  dword [Radius]
+    mov   dword [HandY], 8
+    fimul dword [HandY]
+    mov   dword [HandY], 10
+    fidiv dword [HandY]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [HandY]
+    
+    fstp  st0 ; Pop sin
+    
+    ; Draw Line
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [CenterX]
+    mov   R8D, dword [CenterY]
+    mov   R9, NULL
+    call  MoveToEx
+    add   RSP, 32
+    
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [HandX]
+    mov   R8D, dword [HandY]
+    call  LineTo
+    add   RSP, 32
+
+    ; ---------------------------------------------------------
+    ; Draw Hour Hand
+    ; ---------------------------------------------------------
+    ; Angle = (Hour%12 + Minute/60.0) * PI / 6
+    fild  word [REL SystemTime + 10] ; Minute
+    mov   dword [HandX], 60
+    fidiv dword [HandX]              ; Minute / 60.0
+    
+    fild  word [REL SystemTime + 8]  ; Hour
+    faddp                            ; Hour + Minute/60
+    
+    fldpi
+    fmulp                            ; (H+M/60) * PI
+    mov   dword [HandX], 6
+    fidiv dword [HandX]              ; Angle
+    
+    fsincos
+    
+    ; X: CenterX + (Radius * 0.5) * sin
+    fld   st1
+    fild  dword [Radius]
+    mov   dword [HandX], 5
+    fimul dword [HandX]
+    mov   dword [HandX], 10
+    fidiv dword [HandX]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [HandX]
+    
+    ; Y: CenterY - (Radius * 0.5) * cos
+    fild  dword [Radius]
+    mov   dword [HandY], 5
+    fimul dword [HandY]
+    mov   dword [HandY], 10
+    fidiv dword [HandY]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [HandY]
+    
+    fstp  st0 ; Pop sin
+    
+    ; Draw Line
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [CenterX]
+    mov   R8D, dword [CenterY]
+    mov   R9, NULL
+    call  MoveToEx
+    add   RSP, 32
+    
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, dword [HandX]
+    mov   R8D, dword [HandY]
+    call  LineTo
+    add   RSP, 32
+
+    ; EndPaint
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]
+    lea   RDX, [ps]
+    call  EndPaint
+    add   RSP, 32
+
+    xor   EAX, EAX                 ; Return 0
+    mov   RSP, RBP
+    pop   RBP
+    ret
+
+WMTRAYICON:                        ; Handler for our tray icon message
     mov   RAX, qword [RBP + 40]    ; RAX = mouse message (lParam)
     cmp   RAX, WM_LBUTTONDOWN
     je    .TrayLeftClick
@@ -380,8 +688,6 @@ WMTRAYICON:                        ; Handler for our tray icon message
     jmp   .TrayUnhandled
 
 .TrayLeftClick:
-    ; TODO: Implement left-click action (e.g., show/hide window)
-    ; For now, let's make left-click show the window if it's hidden or bring to front
     mov   RCX, qword [RBP + 16] ; hWnd
     call  IsWindowVisible
     test  RAX, RAX
@@ -396,34 +702,26 @@ WMTRAYICON:                        ; Handler for our tray icon message
     jmp   .TrayHandled
 
 .TrayRightClick:
-    ; Get the cursor position first
     sub   RSP, 32                      ; Shadow space for GetCursorPos
     lea   RCX, [REL pt]                ; RCX = address of POINT structure
     call  GetCursorPos
     add   RSP, 32                      ; Clean up shadow space
 
-    ; To display a menu for a notification icon, the application must make its window the foreground window
     mov   RCX, qword [RBP + 16]        ; RCX = hWnd
     call  SetForegroundWindow
 
-    ; --- Get the submenu handle ---
-    ; Load the main menu bar handle into RCX
     mov   RCX, qword [REL hMenu]
     test  RCX, RCX
     jz    .TrayHandled                 ; Exit if menu handle is null
 
-    ; Get the first (and only) submenu from the menu bar
     sub   RSP, 32                      ; Reserve shadow space for GetSubMenu
     mov   EDX, 0                       ; EDX = uIndex of the submenu
     call  GetSubMenu                   ; Returns submenu handle in RAX
     add   RSP, 32                      ; Clean up shadow space
 
-    ; Check if GetSubMenu returned a valid handle
     test  RAX, RAX
     jz    .TrayHandled                 ; Exit if it failed
 
-    ; --- Display the popup menu ---
-    ; Now RAX holds the handle to the actual popup menu we want to show
     mov   RCX, RAX                     ; RCX = hSubMenu
     mov   EDX, TPM_LEFTALIGN | TPM_RIGHTBUTTON ; RDX = Flags
     mov   R8D, dword [REL pt]          ; R8D = pt.x
@@ -439,19 +737,13 @@ WMTRAYICON:                        ; Handler for our tray icon message
     jmp   .TrayHandled
 
 .TrayUnhandled:
-    ; Pass to DefWindowProc or handle as 0 if not interested
 .TrayHandled:
     xor   EAX, EAX                 ; Return 0, indicating message was handled
-    mov   RSP, RBP                 ; Remove the stack frame
+    mov   RSP, RBP
     pop   RBP
     ret
 
-WCOMMANDHANDLER:                       ; Handles WM_COMMAND messages
-    ; RBP + 16 = hWnd
-    ; RBP + 24 = uMsg (WM_COMMAND)
-    ; RBP + 32 = wParam (HIWORD: notification code, LOWORD: item ID/control ID)
-    ; RBP + 40 = lParam (control handle or 0)
-
+WCOMMANDHANDLER:
     mov   RAX, qword [RBP + 32]    ; RAX = wParam
     movzx EAX, AX                  ; EAX = LOWORD(wParam) = Menu Item ID
 
@@ -466,7 +758,6 @@ WCOMMANDHANDLER:                       ; Handles WM_COMMAND messages
     call  IsWindowVisible
     test  RAX, RAX
     jnz   .MenuShowBringToFront
-    ; If not visible, show it
     mov   RCX, qword [RBP + 16]    ; hWnd
     mov   EDX, SW_SHOWNORMAL
     call  ShowWindow
@@ -483,16 +774,31 @@ WCOMMANDHANDLER:                       ; Handles WM_COMMAND messages
     jmp   .MenuHandled
 
 .MenuUnhandled:
-    ; If not one of our menu items, could be from a control, or unhandled.
-    ; For now, just fall through to returning 0, as if handled.
 .MenuHandled:
     xor   EAX, EAX                 ; Return 0, indicating message was handled
     mov   RSP, RBP
     pop   RBP
     ret
 
+WMTIMER:
+ sub   RSP, 32
+ mov   ECX, 0FFFFFFFFh          ; Simple beep
+ call  MessageBeep
+ add   RSP, 32
+
+ sub   RSP, 32
+ mov   RCX, qword [RBP + 16]    ; hWnd
+ mov   RDX, NULL
+ mov   R8, 1                    ; TRUE (Erase background)
+ call  InvalidateRect
+ add   RSP, 32
+
+ xor   EAX, EAX
+ mov   RSP, RBP
+ pop   RBP
+ ret
+
 WMDESTROY:
-    ; Destroy Menu if loaded
     mov   RCX, qword [REL hMenu]
     test  RCX, RCX
     jz    .SkipDestroyMenu
@@ -501,7 +807,6 @@ WMDESTROY:
     add   RSP, 32
 .SkipDestroyMenu:
 
-    ; Remove tray icon before exiting
     mov   dword [temp_nid.cbSize], 168
     mov   RAX, qword [RBP + 16]        ; hWnd from WndProc's argument
     mov   qword [temp_nid.hWnd], RAX
@@ -513,13 +818,12 @@ WMDESTROY:
     call  Shell_NotifyIconA
     add   RSP, 32                      ; Remove shadow space
 
-    ; Original WM_DESTROY actions
     sub   RSP, 32                      ; 32 bytes of shadow space
     xor   ECX, ECX
     call  PostQuitMessage
     add   RSP, 32                      ; Remove the 32 bytes
 
     xor   EAX, EAX                 ; Return 0
-    mov   RSP, RBP                 ; Remove the stack frame
+    mov   RSP, RBP
     pop   RBP
     ret
