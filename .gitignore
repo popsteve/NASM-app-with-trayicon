@@ -1,0 +1,21 @@
+# Build outputs
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.cache
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Test results
+benchmark-*.json
+performance-comparison.md
+
+# Temporary files
+temp.hex
+*.tmp
+*.log

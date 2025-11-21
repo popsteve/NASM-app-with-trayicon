@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net8.0-windows</TargetFramework>
+        <UseWindowsForms>true</UseWindowsForms>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <PlatformTarget>x64</PlatformTarget>
+
+        <!-- Optimization settings for fair comparison -->
+        <Optimize>true</Optimize>
+        <DebugType>none</DebugType>
+        <DebugSymbols>false</DebugSymbols>
+
+        <!-- Single file publishing options -->
+        <PublishSingleFile>true</PublishSingleFile>
+        <SelfContained>false</SelfContained>
+        <PublishReadyToRun>true</PublishReadyToRun>
+        <PublishTrimmed>false</PublishTrimmed>
+    </PropertyGroup>
+
+</Project>
