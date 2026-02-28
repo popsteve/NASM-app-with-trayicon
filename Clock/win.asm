@@ -76,18 +76,17 @@ extern KillTimer
 extern GetLocalTime
 extern InvalidateRect
 extern DrawTextA
-extern MessageBeep
+
 
 global Start                                    ; Export symbols. The entry point
 
 section .data                                   ; Initialized data segment
- WindowName  db "Basic Window 64", 0
+ WindowName  db "Clock", 0
  ClassName   db "Window", 0
  TrayToolTip db "My Tray Application", 0
  PAINTSTRUCT_SIZE EQU 72
  LogoPath    db "logo.ico", 0
- TimeString  db "00:00:00", 0
- TimeFormat  db "%02d:%02d:%02d", 0
+
 
 section .bss                                    ; Uninitialized data segment
  alignb 8
@@ -117,11 +116,7 @@ Start:
 .LoadMenuOK:
  add   RSP, 32                                  ; Remove shadow space
 
- sub   RSP, 32                                  ; 32 bytes of shadow space for the original GetModuleHandleA call
- xor   ECX, ECX
- call  GetModuleHandleA
- mov   qword [REL hInstance], RAX               ; This GetModuleHandle is actually for WNDCLASSEX.hInstance, ensure it's correct.
- add   RSP, 32                                  ; Remove the 32 bytes
+ ; hInstance already set at line 108
 
  call  WinMain
 
@@ -250,7 +245,7 @@ WinMain:
  lea   RCX, [wc]                                ; [RBP - 136]
  call  RegisterClassExA
  test  RAX, RAX                                 ; Check if registration failed
- jz    ExitWinMain                                ; Exit if failed
+ jz    .Done                                      ; Exit if failed (restore stack frame)
  add   RSP, 32                                  ; Remove the 32 bytes
 
  sub   RSP, 32 + 64                             ; Shadow space + 8 parameters
@@ -269,15 +264,15 @@ WinMain:
  mov   qword [RSP + 11 * 8], NULL
  call  CreateWindowExA
  test  RAX, RAX                                 ; Check if window creation failed
- jz    ExitWinMain                                ; Exit if failed
+ jz    .Done                                      ; Exit if failed (restore stack frame)
  mov   qword [hWnd], RAX                        ; [RBP - 8]
  add   RSP, 96                                  ; Remove the 96 bytes
 
- sub   RSP, 32                                  ; 32 bytes of shadow space
- mov   RCX, qword [hWnd]                        ; [RBP - 8]
- xor   EDX, EDX                                 ; SW_HIDE = 0
- call  ShowWindow
- add   RSP, 32                                  ; Remove the 32 bytes
+  sub   RSP, 32                                  ; 32 bytes of shadow space
+  mov   RCX, qword [hWnd]                        ; [RBP - 8]
+  xor   EDX, EDX                                 ; SW_HIDE = 0 (start hidden, tray-only)
+  call  ShowWindow
+  add   RSP, 32                                  ; Remove the 32 bytes
 
  sub   RSP, 32                                  ; 32 bytes of shadow space
  mov   RCX, qword [hWnd]                        ; [RBP - 8]
@@ -294,11 +289,13 @@ WinMain:
  add   RSP, 48
 
 
- ; Zero out the NOTIFYICONDATA structure before use for NIM_ADD
- lea   RDI, [nid]                             ; RDI = address of nid
- mov   RCX, 168 / 8                            ; Count = 21 qwords (168 bytes)
- xor   RAX, RAX                               ; RAX = 0
- rep   stosq                                  ; Zero out the structure
+  ; Zero out the NOTIFYICONDATA structure before use for NIM_ADD
+  push  RDI                                    ; Save RDI (non-volatile in Win64 ABI)
+  lea   RDI, [nid]                             ; RDI = address of nid
+  mov   RCX, 168 / 8                            ; Count = 21 qwords (168 bytes)
+  xor   RAX, RAX                               ; RAX = 0
+  rep   stosq                                  ; Zero out the structure
+  pop   RDI                                    ; Restore RDI
 
  ; Add Tray Icon
  mov   dword [nid.cbSize], 168                 ; Size of NOTIFYICONDATAA
@@ -534,13 +531,10 @@ WMPAINT:
     fiadd dword [CenterY]
     fistp dword [HandY]              ; Store Y
     
-    fstp  st0                        ; Pop sin (st0 was cos, popped by fistp? No wait)
-                                     ; Stack track:
-                                     ; Start: [Cos, Sin]
-                                     ; X calc: Pushed Sin, Radius... Popped all. Stack: [Cos, Sin]
-                                     ; Y calc: Pushed Radius... Popped all. Stack: [Sin] (Because Cos was popped by fistp)
-                                     ; So st0 is Sin.
-    fstp st0                         ; Empty stack
+    fstp  st0                        ; Pop remaining sin value from FPU stack
+                                     ; After fsincos: [Cos, Sin]
+                                     ; X calc consumed a copy of Sin; Y calc consumed Cos via fistp
+                                     ; One Sin remains — pop it here
     
     ; Draw Line
     sub   RSP, 32
@@ -688,17 +682,23 @@ WMTRAYICON:                        ; Handler for our tray icon message
     jmp   .TrayUnhandled
 
 .TrayLeftClick:
-    mov   RCX, qword [RBP + 16] ; hWnd
+    sub   RSP, 32                  ; Shadow space
+    mov   RCX, qword [RBP + 16]    ; hWnd
     call  IsWindowVisible
+    add   RSP, 32
     test  RAX, RAX
-    jnz   .BringToFront     ; If visible, just bring to front
+    jnz   .BringToFront            ; If visible, just bring to front
     ; If not visible, show it
-    mov   RCX, qword [RBP + 16] ; hWnd
+    sub   RSP, 32                  ; Shadow space
+    mov   RCX, qword [RBP + 16]    ; hWnd
     mov   EDX, SW_SHOWNORMAL
     call  ShowWindow
+    add   RSP, 32
 .BringToFront:
-    mov   RCX, qword [RBP + 16] ; hWnd
+    sub   RSP, 32                  ; Shadow space
+    mov   RCX, qword [RBP + 16]    ; hWnd
     call  SetForegroundWindow
+    add   RSP, 32
     jmp   .TrayHandled
 
 .TrayRightClick:
@@ -707,8 +707,10 @@ WMTRAYICON:                        ; Handler for our tray icon message
     call  GetCursorPos
     add   RSP, 32                      ; Clean up shadow space
 
+    sub   RSP, 32                      ; Shadow space for SetForegroundWindow
     mov   RCX, qword [RBP + 16]        ; RCX = hWnd
     call  SetForegroundWindow
+    add   RSP, 32
 
     mov   RCX, qword [REL hMenu]
     test  RCX, RCX
@@ -754,16 +756,22 @@ WCOMMANDHANDLER:
     jmp   .MenuUnhandled
 
 .MenuShow:
+    sub   RSP, 32                  ; Shadow space
     mov   RCX, qword [RBP + 16]    ; hWnd
     call  IsWindowVisible
+    add   RSP, 32
     test  RAX, RAX
     jnz   .MenuShowBringToFront
+    sub   RSP, 32                  ; Shadow space
     mov   RCX, qword [RBP + 16]    ; hWnd
     mov   EDX, SW_SHOWNORMAL
     call  ShowWindow
+    add   RSP, 32
 .MenuShowBringToFront:
+    sub   RSP, 32                  ; Shadow space
     mov   RCX, qword [RBP + 16]    ; hWnd
     call  SetForegroundWindow
+    add   RSP, 32
     jmp   .MenuHandled
 
 .MenuExit:
@@ -781,10 +789,6 @@ WCOMMANDHANDLER:
     ret
 
 WMTIMER:
- sub   RSP, 32
- mov   ECX, 0FFFFFFFFh          ; Simple beep
- call  MessageBeep
- add   RSP, 32
 
  sub   RSP, 32
  mov   RCX, qword [RBP + 16]    ; hWnd

@@ -6,4 +6,6 @@
 #define IDM_SHOW    102
 #define IDM_EXIT    103
 
+#define IDI_MYICON  201
+
 #endif // RESOURCE_H 
