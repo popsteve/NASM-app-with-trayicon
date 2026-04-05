@@ -39,10 +39,11 @@ DT_VCENTER          EQU 4
 DT_SINGLELINE       EQU 20h
 
 
-WindowWidth         EQU 640
-WindowHeight        EQU 480
+WindowWidth         EQU 420
+WindowHeight        EQU 440
 
 extern CreateWindowExA                          ; Import external symbols
+extern GetSystemMetrics
 extern DefWindowProcA                           ; Windows API functions, not decorated
 extern DispatchMessageA
 extern ExitProcess
@@ -76,6 +77,23 @@ extern KillTimer
 extern GetLocalTime
 extern InvalidateRect
 extern DrawTextA
+extern CreatePen
+extern SelectObject
+extern DeleteObject
+extern CreateSolidBrush
+extern GdiplusStartup
+extern GdiplusShutdown
+extern GdipCreateFromHDC
+extern GdipDeleteGraphics
+extern GdipSetSmoothingMode
+extern GdipCreatePen1
+extern GdipDeletePen
+extern GdipDrawLineI
+extern GdipDrawEllipseI
+extern GdipCreateSolidFill
+extern GdipDeleteBrush
+extern GdipFillEllipseI
+extern GdipFillRectangleI
 
 
 global Start                                    ; Export symbols. The entry point
@@ -86,6 +104,26 @@ section .data                                   ; Initialized data segment
  TrayToolTip db "My Tray Application", 0
  PAINTSTRUCT_SIZE EQU 72
  LogoPath    db "logo.ico", 0
+ PS_SOLID    EQU 0
+ HOUR_PEN_WIDTH   EQU 5
+ MINUTE_PEN_WIDTH EQU 3
+ SECOND_PEN_WIDTH EQU 1
+ GdiplusVersion   EQU 1
+ UnitPixel        EQU 2
+ SmoothingAntiAlias EQU 4
+ ; GdiplusStartupInput structure (24 bytes on x64)
+ GdiplusStartupInputData:
+  dd GdiplusVersion              ; GdiplusVersion = 1
+  dd 0                           ; padding for pointer alignment
+  dq 0                           ; DebugEventCallback = NULL
+  dd 0                           ; SuppressBackgroundThread = FALSE
+  dd 0                           ; SuppressExternalCodecs = FALSE
+ ; Float pen widths for GDI+ (REAL = single-precision float)
+ fPenWidth1  dd 1.0
+ fPenWidth2  dd 2.0
+ fPenWidth3  dd 3.0
+ fPenWidth5  dd 5.0
+ fPenWidth7  dd 7.0
 
 
 section .bss                                    ; Uninitialized data segment
@@ -94,6 +132,8 @@ section .bss                                    ; Uninitialized data segment
  hMenu     resq 1                               ; Handle for the loaded menu
  pt        resq 1                               ; POINT structure for GetCursorPos (x, y as LONGs)
  SystemTime resb 16                             ; SYSTEMTIME structure
+ gdiplusToken resq 1                            ; GDI+ startup token
+ hBgBrush  resq 1                               ; Background brush handle
 
 
 section .text                                   ; Code segment
@@ -176,14 +216,14 @@ WinMain:
  mov   qword [wc.hInstance], RAX                ; [RBP - 112]
 
  sub   RSP, 32 + 16                             ; Shadow space + 2 parameters
- xor   ECX, ECX                                 ; ECX = NULL
- lea   RDX, [REL LogoPath]                      ; RDX = Path to logo.ico
+ mov   RCX, qword [REL hInstance]               ; RCX = hInstance (load from resource)
+ mov   EDX, IDI_MYICON                          ; RDX = Resource ID 201
  mov   R8D, IMAGE_ICON
  xor   R9D, R9D
  mov   qword [RSP + 4 * 8], NULL
- mov   qword [RSP + 5 * 8], LR_LOADFROMFILE
- call  LoadImageA                               ; Large program icon
- test  RAX, RAX                                 ; Check if custom icon loaded
+ mov   qword [RSP + 5 * 8], LR_SHARED
+ call  LoadImageA                               ; Large program icon from resource
+ test  RAX, RAX                                 ; Check if resource icon loaded
  jnz   .CustomIconLoaded1                       ; If loaded, use it
  ; Fallback to system icon
  xor   ECX, ECX
@@ -208,20 +248,27 @@ WinMain:
  mov   qword [wc.hCursor], RAX                  ; [RBP - 96]
  add   RSP, 48                                  ; Remove the 48 bytes
 
- mov   qword [wc.hbrBackground], COLOR_WINDOW + 1  ; [RBP - 88]
+ ; Create dark background brush (COLORREF is BGR: #0D1117 -> 0x0017110D)
+ sub   RSP, 32
+ mov   ECX, 0x0017110D
+ call  CreateSolidBrush
+ mov   qword [REL hBgBrush], RAX
+ add   RSP, 32
+ mov   qword [wc.hbrBackground], RAX            ; [RBP - 88] dark background
+
  mov   qword [wc.lpszMenuName], NULL            ; [RBP - 80]
  lea   RAX, [REL ClassName]
  mov   qword [wc.lpszClassName], RAX            ; [RBP - 72]
 
  sub   RSP, 32 + 16                             ; Shadow space + 2 parameters
- xor   ECX, ECX                                 ; ECX = NULL
- lea   RDX, [REL LogoPath]                      ; RDX = Path to logo.ico
+ mov   RCX, qword [REL hInstance]               ; RCX = hInstance (load from resource)
+ mov   EDX, IDI_MYICON                          ; RDX = Resource ID 201
  mov   R8D, IMAGE_ICON
- xor   R9D, R9D
- mov   qword [RSP + 4 * 8], NULL
- mov   qword [RSP + 5 * 8], LR_LOADFROMFILE
- call  LoadImageA                               ; Small program icon
- test  RAX, RAX                                 ; Check if custom icon loaded
+ mov   R9D, 16                                  ; Desired width = 16 (small icon)
+ mov   qword [RSP + 4 * 8], 16                  ; Desired height = 16
+ mov   qword [RSP + 5 * 8], LR_SHARED
+ call  LoadImageA                               ; Small program icon from resource
+ test  RAX, RAX                                 ; Check if resource icon loaded
  jnz   .CustomIconLoaded2                       ; If loaded, use it
  ; Fallback to system icon
  xor   ECX, ECX
@@ -248,13 +295,32 @@ WinMain:
  jz    .Done                                      ; Exit if failed (restore stack frame)
  add   RSP, 32                                  ; Remove the 32 bytes
 
+ ; Get screen size and compute centered position
+ sub   RSP, 32
+ xor   ECX, ECX                                 ; SM_CXSCREEN = 0
+ call  GetSystemMetrics
+ sub   EAX, WindowWidth
+ shr   EAX, 1                                   ; X = (screenW - winW) / 2
+ mov   dword [nid.uID], EAX                     ; stash X in unused nid field
+ add   RSP, 32
+
+ sub   RSP, 32
+ mov   ECX, 1                                   ; SM_CYSCREEN = 1
+ call  GetSystemMetrics
+ sub   EAX, WindowHeight
+ shr   EAX, 1                                   ; Y = (screenH - winH) / 2
+ mov   dword [nid.uFlags], EAX                  ; stash Y in unused nid field
+ add   RSP, 32
+
  sub   RSP, 32 + 64                             ; Shadow space + 8 parameters
  mov   ECX, WS_EX_COMPOSITED
  lea   RDX, [REL ClassName]                     ; Global
  lea   R8, [REL WindowName]                     ; Global
  mov   R9D, WS_OVERLAPPEDWINDOW
- mov   dword [RSP + 4 * 8], CW_USEDEFAULT
- mov   dword [RSP + 5 * 8], CW_USEDEFAULT
+ mov   EAX, dword [nid.uID]                     ; retrieve centered X
+ mov   dword [RSP + 4 * 8], EAX
+ mov   EAX, dword [nid.uFlags]                  ; retrieve centered Y
+ mov   dword [RSP + 5 * 8], EAX
  mov   dword [RSP + 6 * 8], WindowWidth
  mov   dword [RSP + 7 * 8], WindowHeight
  mov   qword [RSP + 8 * 8], NULL
@@ -270,7 +336,7 @@ WinMain:
 
   sub   RSP, 32                                  ; 32 bytes of shadow space
   mov   RCX, qword [hWnd]                        ; [RBP - 8]
-  xor   EDX, EDX                                 ; SW_HIDE = 0 (start hidden, tray-only)
+  mov   EDX, SW_SHOWNORMAL                       ; Show window on startup
   call  ShowWindow
   add   RSP, 32                                  ; Remove the 32 bytes
 
@@ -287,6 +353,14 @@ WinMain:
  mov   R9, NULL
  call  SetTimer
  add   RSP, 48
+
+ ; Initialize GDI+
+ sub   RSP, 32
+ lea   RCX, [REL gdiplusToken]                  ; &token
+ lea   RDX, [REL GdiplusStartupInputData]        ; &input struct
+ xor   R8D, R8D                                 ; output = NULL
+ call  GdiplusStartup
+ add   RSP, 32
 
 
   ; Zero out the NOTIFYICONDATA structure before use for NIM_ADD
@@ -379,7 +453,7 @@ WinMain:
 WndProc:
     push  RBP
     mov   RBP, RSP
-    sub   RSP, 208 ; Shadow space (32) + NOTIFYICONDATA (168) = 200, rounded up to 208 bytes (16-byte aligned)
+    sub   RSP, 288 ; Extended for tick-mark loop variables
 
     ; Stack layout
     %define temp_nid           RBP - 208
@@ -388,7 +462,7 @@ WndProc:
     %define temp_nid.uID       RBP - 192
     %define ps                 RBP - 120 ; PAINTSTRUCT (72 bytes)
     %define hdc                RBP - 48  ; HDC (8 bytes)
-    %define rect               RBP - 144 ; MODIFIED: RECT structure (16 bytes)
+    %define rect               RBP - 144 ; RECT structure (16 bytes)
     %define rect.left          RBP - 144
     %define rect.top           RBP - 140
     %define rect.right         RBP - 136
@@ -398,6 +472,16 @@ WndProc:
     %define Radius             RBP - 156
     %define HandX              RBP - 160
     %define HandY              RBP - 164
+    %define hGraphics          RBP - 176   ; GpGraphics* (8 bytes)
+    %define hGdipPen           RBP - 184   ; GpPen*      (8 bytes)
+    %define hGdipBrush         RBP - 216   ; GpBrush*    (8 bytes)
+    %define TickX1             RBP - 220   ; outer X
+    %define TickY1             RBP - 224   ; outer Y
+    %define TickX2             RBP - 228   ; inner X
+    %define TickY2             RBP - 232   ; inner Y
+    %define TickCount          RBP - 236   ; loop counter
+    %define TickInnerR         RBP - 240   ; inner radius for ticks
+    %define TickDiv            RBP - 244   ; divisor scratch
 
     ; Save parameters (passed in RCX, RDX, R8, R9)
     mov   qword [RBP + 16], RCX    ; hWnd
@@ -435,15 +519,17 @@ DefaultMessage:
     ret
 
 WMPAINT:
-    ; Call BeginPaint
+    ; =========================================================
+    ;  BeginPaint
+    ; =========================================================
     sub   RSP, 32
-    mov   RCX, qword [RBP + 16]    ; hWnd
-    lea   RDX, [ps]                ; Address of PAINTSTRUCT
+    mov   RCX, qword [RBP + 16]
+    lea   RDX, [ps]
     call  BeginPaint
-    mov   qword [hdc], RAX         ; Save HDC
+    mov   qword [hdc], RAX
     add   RSP, 32
 
-    ; Get Client Rect
+    ; GetClientRect
     sub   RSP, 32
     mov   RCX, qword [RBP + 16]
     lea   RDX, [rect]
@@ -451,177 +537,318 @@ WMPAINT:
     add   RSP, 32
 
     ; Calculate Center and Radius
-    ; CenterX = rect.right / 2
     mov   EAX, dword [rect.right]
     shr   EAX, 1
     mov   dword [CenterX], EAX
-
-    ; CenterY = rect.bottom / 2
     mov   EAX, dword [rect.bottom]
     shr   EAX, 1
     mov   dword [CenterY], EAX
-
-    ; Radius = min(CenterX, CenterY) - 10
     mov   ECX, dword [CenterX]
     cmp   ECX, dword [CenterY]
-    cmovg ECX, dword [CenterY]     ; ECX = min(CenterX, CenterY)
-    sub   ECX, 10
+    cmovg ECX, dword [CenterY]
+    sub   ECX, 20                  ; margin
     mov   dword [Radius], ECX
 
-    ; Draw Clock Face (Ellipse)
-    sub   RSP, 48                  ; Shadow (32) + 5th param (8) + alignment
+    ; =========================================================
+    ;  Create GDI+ Graphics & enable anti-aliasing
+    ; =========================================================
+    sub   RSP, 32
     mov   RCX, qword [hdc]
-    
-    mov   EDX, dword [CenterX]
-    sub   EDX, dword [Radius]      ; Left
-    
-    mov   R8D, dword [CenterY]
-    sub   R8D, dword [Radius]      ; Top
-    
-    mov   R9D, dword [CenterX]
-    add   R9D, dword [Radius]      ; Right
-    
-    mov   EAX, dword [CenterY]
-    add   EAX, dword [Radius]      ; Bottom
-    mov   qword [RSP + 32], RAX    ; 5th param
-    
-    call  Ellipse
+    lea   RDX, [hGraphics]
+    call  GdipCreateFromHDC
+    add   RSP, 32
+
+    sub   RSP, 32
+    mov   RCX, qword [hGraphics]
+    mov   RDX, SmoothingAntiAlias
+    call  GdipSetSmoothingMode
+    add   RSP, 32
+
+    ; =========================================================
+    ;  1. Fill entire background  (dark: 0xFF0D1117)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFF0D1117
+    lea   RDX, [hGdipBrush]
+    call  GdipCreateSolidFill
+    add   RSP, 32
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipBrush]
+    xor   R8D, R8D
+    xor   R9D, R9D
+    mov   EAX, dword [rect.right]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [rect.bottom]
+    mov   dword [RSP + 40], EAX
+    call  GdipFillRectangleI
     add   RSP, 48
 
-    ; Get Time
+    sub   RSP, 32
+    mov   RCX, qword [hGdipBrush]
+    call  GdipDeleteBrush
+    add   RSP, 32
+
+    ; =========================================================
+    ;  2. Fill clock face circle  (0xFF161B22)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFF161B22
+    lea   RDX, [hGdipBrush]
+    call  GdipCreateSolidFill
+    add   RSP, 32
+
+    ; Precompute ellipse bounds (reuse TickX1/Y1/X2 as scratch)
+    mov   EAX, dword [CenterX]
+    sub   EAX, dword [Radius]
+    mov   dword [TickX1], EAX      ; left
+    mov   EAX, dword [CenterY]
+    sub   EAX, dword [Radius]
+    mov   dword [TickY1], EAX      ; top
+    mov   EAX, dword [Radius]
+    shl   EAX, 1
+    mov   dword [TickX2], EAX      ; diameter
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipBrush]
+    mov   R8D, dword [TickX1]
+    mov   R9D, dword [TickY1]
+    mov   EAX, dword [TickX2]
+    mov   dword [RSP + 32], EAX
+    mov   dword [RSP + 40], EAX
+    call  GdipFillEllipseI
+    add   RSP, 48
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipBrush]
+    call  GdipDeleteBrush
+    add   RSP, 32
+
+    ; =========================================================
+    ;  3. Draw clock border ring (0xFF30363D, 2px)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFF30363D
+    movss XMM1, [REL fPenWidth2]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
+    add   RSP, 32
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [TickX1]
+    mov   R9D, dword [TickY1]
+    mov   EAX, dword [TickX2]
+    mov   dword [RSP + 32], EAX
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawEllipseI
+    add   RSP, 48
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
+    add   RSP, 32
+
+    ; =========================================================
+    ;  4. Draw 60 minute tick marks  (dim gray, 1px)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFF484F58
+    movss XMM1, [REL fPenWidth1]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
+    add   RSP, 32
+
+    ; TickInnerR = Radius * 93 / 100
+    mov   EAX, dword [Radius]
+    imul  EAX, 93
+    mov   ECX, 100
+    cdq
+    idiv  ECX
+    mov   dword [TickInnerR], EAX
+
+    mov   dword [TickCount], 0
+.MinuteTickLoop:
+    cmp   dword [TickCount], 60
+    jge   .MinuteTickDone
+
+    fild  dword [TickCount]
+    fldpi
+    fmulp
+    mov   dword [TickDiv], 30
+    fidiv dword [TickDiv]
+    fsincos                        ; st0=cos, st1=sin
+
+    ; Outer X = CenterX + Radius * sin
+    fld   st1
+    fild  dword [Radius]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [TickX1]
+
+    ; Outer Y = CenterY - Radius * cos
+    fld   st0
+    fild  dword [Radius]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [TickY1]
+
+    ; Inner X = CenterX + TickInnerR * sin
+    fld   st1
+    fild  dword [TickInnerR]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [TickX2]
+
+    ; Inner Y = CenterY - TickInnerR * cos
+    fld   st0                      ; copy cos
+    fild  dword [TickInnerR]
+    fmulp                          ; st0 = TickInnerR * cos
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [TickY2]
+
+    fstp  st0                      ; pop cos
+    fstp  st0                      ; pop sin
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [TickX1]
+    mov   R9D, dword [TickY1]
+    mov   EAX, dword [TickX2]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [TickY2]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    inc   dword [TickCount]
+    jmp   .MinuteTickLoop
+.MinuteTickDone:
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
+    add   RSP, 32
+
+    ; =========================================================
+    ;  5. Draw 12 hour tick marks  (light, 3px, longer)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFFC9D1D9
+    movss XMM1, [REL fPenWidth3]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
+    add   RSP, 32
+
+    ; TickInnerR = Radius * 82 / 100
+    mov   EAX, dword [Radius]
+    imul  EAX, 82
+    mov   ECX, 100
+    cdq
+    idiv  ECX
+    mov   dword [TickInnerR], EAX
+
+    mov   dword [TickCount], 0
+.HourTickLoop:
+    cmp   dword [TickCount], 12
+    jge   .HourTickDone
+
+    fild  dword [TickCount]
+    fldpi
+    fmulp
+    mov   dword [TickDiv], 6
+    fidiv dword [TickDiv]
+    fsincos
+
+    fld   st1
+    fild  dword [Radius]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [TickX1]
+
+    fld   st0
+    fild  dword [Radius]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [TickY1]
+
+    fld   st1
+    fild  dword [TickInnerR]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [TickX2]
+
+    fld   st0                      ; copy cos
+    fild  dword [TickInnerR]
+    fmulp                          ; st0 = TickInnerR * cos
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [TickY2]
+
+    fstp  st0
+    fstp  st0
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [TickX1]
+    mov   R9D, dword [TickY1]
+    mov   EAX, dword [TickX2]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [TickY2]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    inc   dword [TickCount]
+    jmp   .HourTickLoop
+.HourTickDone:
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
+    add   RSP, 32
+
+    ; =========================================================
+    ;  Get current time
+    ; =========================================================
     sub   RSP, 32
     lea   RCX, [REL SystemTime]
     call  GetLocalTime
     add   RSP, 32
 
-    ; ---------------------------------------------------------
-    ; Draw Second Hand
-    ; ---------------------------------------------------------
-    ; Angle = Second * PI / 30
-    fild  word [REL SystemTime + 12] ; Load Second
-    fldpi                            ; Load PI
-    fmulp                            ; S * PI
-    mov   dword [HandX], 30          ; Use HandX as temp for 30
-    fidiv dword [HandX]              ; (S * PI) / 30
-    
-    fsincos                          ; st0 = cos, st1 = sin
-    
-    ; Calculate Target X: CenterX + (Radius * 0.9) * sin(Angle)
-    fld   st1                        ; Copy sin
-    fild  dword [Radius]
-    mov   dword [HandX], 9
-    fimul dword [HandX]
-    mov   dword [HandX], 10
-    fidiv dword [HandX]              ; Radius * 0.9
-    
-    fmulp                            ; (Radius*0.9) * sin
-    fiadd dword [CenterX]
-    fistp dword [HandX]              ; Store X
-    
-    ; Calculate Target Y: CenterY - (Radius * 0.9) * cos(Angle)
-    ; st0 is now cos
-    fild  dword [Radius]
-    mov   dword [HandY], 9
-    fimul dword [HandY]
-    mov   dword [HandY], 10
-    fidiv dword [HandY]              ; Radius * 0.9
-    
-    fmulp                            ; (Radius*0.9) * cos
-    fchs                             ; Negate
-    fiadd dword [CenterY]
-    fistp dword [HandY]              ; Store Y
-    
-    fstp  st0                        ; Pop remaining sin value from FPU stack
-                                     ; After fsincos: [Cos, Sin]
-                                     ; X calc consumed a copy of Sin; Y calc consumed Cos via fistp
-                                     ; One Sin remains — pop it here
-    
-    ; Draw Line
+    ; =========================================================
+    ;  6. Draw Hour Hand  (7px, off-white 0xFFC9D1D9, 50% radius)
+    ; =========================================================
     sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [CenterX]
-    mov   R8D, dword [CenterY]
-    mov   R9, NULL
-    call  MoveToEx
-    add   RSP, 32
-    
-    sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [HandX]
-    mov   R8D, dword [HandY]
-    call  LineTo
+    mov   ECX, 0xFFC9D1D9
+    movss XMM1, [REL fPenWidth7]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
     add   RSP, 32
 
-    ; ---------------------------------------------------------
-    ; Draw Minute Hand
-    ; ---------------------------------------------------------
-    ; Angle = Minute * PI / 30
-    fild  word [REL SystemTime + 10] ; Load Minute
-    fldpi
-    fmulp
-    mov   dword [HandX], 30
-    fidiv dword [HandX]
-    fsincos
-    
-    ; X: CenterX + (Radius * 0.8) * sin
-    fld   st1
-    fild  dword [Radius]
-    mov   dword [HandX], 8
-    fimul dword [HandX]
-    mov   dword [HandX], 10
-    fidiv dword [HandX]
-    fmulp
-    fiadd dword [CenterX]
-    fistp dword [HandX]
-    
-    ; Y: CenterY - (Radius * 0.8) * cos
-    fild  dword [Radius]
-    mov   dword [HandY], 8
-    fimul dword [HandY]
-    mov   dword [HandY], 10
-    fidiv dword [HandY]
-    fmulp
-    fchs
-    fiadd dword [CenterY]
-    fistp dword [HandY]
-    
-    fstp  st0 ; Pop sin
-    
-    ; Draw Line
-    sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [CenterX]
-    mov   R8D, dword [CenterY]
-    mov   R9, NULL
-    call  MoveToEx
-    add   RSP, 32
-    
-    sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [HandX]
-    mov   R8D, dword [HandY]
-    call  LineTo
-    add   RSP, 32
-
-    ; ---------------------------------------------------------
-    ; Draw Hour Hand
-    ; ---------------------------------------------------------
-    ; Angle = (Hour%12 + Minute/60.0) * PI / 6
     fild  word [REL SystemTime + 10] ; Minute
     mov   dword [HandX], 60
-    fidiv dword [HandX]              ; Minute / 60.0
-    
+    fidiv dword [HandX]              ; Minute/60
     fild  word [REL SystemTime + 8]  ; Hour
     faddp                            ; Hour + Minute/60
-    
     fldpi
-    fmulp                            ; (H+M/60) * PI
+    fmulp
     mov   dword [HandX], 6
-    fidiv dword [HandX]              ; Angle
-    
+    fidiv dword [HandX]              ; angle = (H+M/60)*PI/6
     fsincos
-    
-    ; X: CenterX + (Radius * 0.5) * sin
+
     fld   st1
     fild  dword [Radius]
     mov   dword [HandX], 5
@@ -631,8 +858,7 @@ WMPAINT:
     fmulp
     fiadd dword [CenterX]
     fistp dword [HandX]
-    
-    ; Y: CenterY - (Radius * 0.5) * cos
+
     fild  dword [Radius]
     mov   dword [HandY], 5
     fimul dword [HandY]
@@ -642,26 +868,174 @@ WMPAINT:
     fchs
     fiadd dword [CenterY]
     fistp dword [HandY]
-    
-    fstp  st0 ; Pop sin
-    
-    ; Draw Line
+
+    fstp  st0
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [CenterX]
+    mov   R9D, dword [CenterY]
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
     sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [CenterX]
-    mov   R8D, dword [CenterY]
-    mov   R9, NULL
-    call  MoveToEx
-    add   RSP, 32
-    
-    sub   RSP, 32
-    mov   RCX, qword [hdc]
-    mov   EDX, dword [HandX]
-    mov   R8D, dword [HandY]
-    call  LineTo
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
     add   RSP, 32
 
-    ; EndPaint
+    ; =========================================================
+    ;  7. Draw Minute Hand  (3px, blue 0xFF58A6FF, 75% radius)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFF58A6FF
+    movss XMM1, [REL fPenWidth3]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
+    add   RSP, 32
+
+    fild  word [REL SystemTime + 10] ; Minute
+    fldpi
+    fmulp
+    mov   dword [HandX], 30
+    fidiv dword [HandX]
+    fsincos
+
+    fld   st1
+    fild  dword [Radius]
+    mov   dword [HandX], 75
+    fimul dword [HandX]
+    mov   dword [HandX], 100
+    fidiv dword [HandX]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [HandX]
+
+    fild  dword [Radius]
+    mov   dword [HandY], 75
+    fimul dword [HandY]
+    mov   dword [HandY], 100
+    fidiv dword [HandY]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [HandY]
+
+    fstp  st0
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [CenterX]
+    mov   R9D, dword [CenterY]
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
+    add   RSP, 32
+
+    ; =========================================================
+    ;  8. Draw Second Hand  (1px, red 0xFFF85149, 90% radius)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFFF85149
+    movss XMM1, [REL fPenWidth1]
+    mov   R8D, UnitPixel
+    lea   R9, [hGdipPen]
+    call  GdipCreatePen1
+    add   RSP, 32
+
+    fild  word [REL SystemTime + 12] ; Second
+    fldpi
+    fmulp
+    mov   dword [HandX], 30
+    fidiv dword [HandX]
+    fsincos
+
+    fld   st1
+    fild  dword [Radius]
+    mov   dword [HandX], 9
+    fimul dword [HandX]
+    mov   dword [HandX], 10
+    fidiv dword [HandX]
+    fmulp
+    fiadd dword [CenterX]
+    fistp dword [HandX]
+
+    fild  dword [Radius]
+    mov   dword [HandY], 9
+    fimul dword [HandY]
+    mov   dword [HandY], 10
+    fidiv dword [HandY]
+    fmulp
+    fchs
+    fiadd dword [CenterY]
+    fistp dword [HandY]
+
+    fstp  st0
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipPen]
+    mov   R8D, dword [CenterX]
+    mov   R9D, dword [CenterY]
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipPen]
+    call  GdipDeletePen
+    add   RSP, 32
+
+    ; =========================================================
+    ;  9. Draw center dot  (red filled circle, radius 6)
+    ; =========================================================
+    sub   RSP, 32
+    mov   ECX, 0xFFF85149
+    lea   RDX, [hGdipBrush]
+    call  GdipCreateSolidFill
+    add   RSP, 32
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [hGdipBrush]
+    mov   R8D, dword [CenterX]
+    sub   R8D, 6
+    mov   R9D, dword [CenterY]
+    sub   R9D, 6
+    mov   dword [RSP + 32], 12
+    mov   dword [RSP + 40], 12
+    call  GdipFillEllipseI
+    add   RSP, 48
+
+    sub   RSP, 32
+    mov   RCX, qword [hGdipBrush]
+    call  GdipDeleteBrush
+    add   RSP, 32
+
+    ; =========================================================
+    ;  Cleanup GDI+ Graphics, then EndPaint
+    ; =========================================================
+    sub   RSP, 32
+    mov   RCX, qword [hGraphics]
+    call  GdipDeleteGraphics
+    add   RSP, 32
+
     sub   RSP, 32
     mov   RCX, qword [RBP + 16]
     lea   RDX, [ps]
@@ -803,6 +1177,21 @@ WMTIMER:
  ret
 
 WMDESTROY:
+    ; Shutdown GDI+
+    sub   RSP, 32
+    mov   RCX, qword [REL gdiplusToken]
+    call  GdiplusShutdown
+    add   RSP, 32
+
+    ; Delete background brush
+    mov   RCX, qword [REL hBgBrush]
+    test  RCX, RCX
+    jz    .SkipDeleteBrush
+    sub   RSP, 32
+    call  DeleteObject
+    add   RSP, 32
+.SkipDeleteBrush:
+
     mov   RCX, qword [REL hMenu]
     test  RCX, RCX
     jz    .SkipDestroyMenu

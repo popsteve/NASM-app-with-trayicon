@@ -1,6 +1,6 @@
-// 201 ICON "logo.ico"
+201 ICON "logo.ico"
 
-// Menu resource definition  
+// Menu resource definition
 101 MENU DISCARDABLE
 {
     POPUP "&Action"
@@ -9,4 +9,4 @@
         MENUITEM SEPARATOR
         MENUITEM "E&xit", 103
     }
-} 
+}
