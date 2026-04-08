@@ -1,37 +1,53 @@
-# NASM Windows App with Tray Icon & Analog Clock
+# ASM Native Clock
 
-A lightweight Windows application written in x64 Assembly (NASM) featuring a system tray icon, context menu, and a GDI-based analog clock.
+A high-performance, lightweight Windows analog clock application written entirely in x64 Assembly (NASM). It features a system tray icon, context menu, and a premium anti-aliased UI rendered via GDI+.
 
-## Features
+## ✨ Features & Optimizations
 
-- **Analog Clock**: Displays the current system time using an analog clock face drawn with GDI. Hand angles are calculated using FPU instructions.
-- **System Tray Icon**: Minimizes to the system tray.
-- **Context Menu**: Right-click the tray icon to access a menu with "Show" and "Exit" options.
-- **Window Management**: Can be minimized to the tray and restored.
+- **High-Quality Rendering (GDI+)**: Fully anti-aliased clock hands, tick marks, and background.
+- **SSE2 Vectorization**: All x87 FPU instructions have been completely eliminated. The application uses a custom 60-entry precomputed `sin`/`cos` lookup table, combined with sub-tick linear interpolation for the hour hand, achieving high precision using purely `mulsd`/`addsd`/`cvttsd2si` SSE2 instructions.
+- **Zero-Flicker Double Buffering**: Implements a manual off-screen memory DC (`CreateCompatibleDC` + `CreateCompatibleBitmap`). Every frame is rendered entirely in memory and pushed to the screen via a single `BitBlt`, eliminating window-maximize flicker.
+- **GDI+ Object Caching**: Bypasses the expensive per-frame handle allocation (Heap Alloc/Free) by pre-caching 6 pens and 3 brushes globally at application initialization.
+- **System Tray Integration**: Quietly minimizes to the taskbar system tray with a right-click context menu.
 
-## Prerequisites
+## 🛠 Prerequisites
 
-To build this project, you need the following tools in your PATH:
+To build this project, you need the following tools in your `PATH`:
 
-- **NASM**: The Netwide Assembler (for assembling `win.asm`).
-- **GoLink**: Linker for Windows (for linking `win.obj` and resources).
-- **GoRC**: Resource Compiler (for compiling `resource.rc`).
+1. **NASM**: The Netwide Assembler (`nasm`) for assembling the `win.asm` code.
+2. **GoLink**: Lightweight Linker for Windows to bind the `obj` file with Windows API DLLs.
+3. **GoRC**: Resource Compiler to compile the icon and menu resources (`resource.rc`).
 
-## Build Instructions
+## 🚀 Build Instructions
 
-A batch script is provided to automate the build process.
+A batch script (`build_auto.bat`) is provided to fully automate the build process.
 
-1.  Open a command prompt or PowerShell in the project directory.
-2.  Run the build script:
-    ```cmd
-    .\build_auto.bat
-    ```
+1. Open a Command Prompt or PowerShell in the project directory.
+2. Run the build script:
+   ```cmd
+   .\build_auto.bat
+   ```
 
-This will compile the resources, assemble the code, and link the executable `win.exe`.
+### Manual Compilation Pipeline
 
-## Usage
+If you prefer to compile it manually, the exact pipeline is:
 
-1.  Run `win.exe`.
-2.  The window will appear showing the analog clock.
-3.  You can minimize the window to the system tray.
-4.  Right-click the tray icon to Show the window or Exit the application.
+1. **Compile Resources**: 
+   ```cmd
+   GoRC.Exe /r resource.rc
+   ```
+2. **Assemble Code**:
+   ```cmd
+   nasm -f win64 win.asm -o win.obj
+   ```
+3. **Link Executable**:
+   ```cmd
+   GoLink.Exe /console win.obj resource.res kernel32.dll user32.dll gdi32.dll gdiplus.dll shell32.dll
+   ```
+
+## 🎮 Usage
+
+1. Run the generated `win.exe`.
+2. The window will display the real-time analog clock.
+3. Minimize the window to hide it into the system tray.
+4. Right-click the tray icon to **Show** the window or **Exit** the application.
