@@ -25,7 +25,9 @@ NIF_TIP             EQU 4
 WM_USER             EQU 0400h
 WM_TRAYICON_MSG     EQU WM_USER + 1               ; Our custom tray icon message
 WM_LBUTTONDOWN      EQU 0201h
+WM_LBUTTONDBLCLK    EQU 0203h
 WM_RBUTTONDOWN      EQU 0204h
+SW_HIDE             EQU 0
 WM_COMMAND          EQU 0111h                     ; Message for menu clicks
 IDR_MYMENU          EQU 101                       ; Menu resource ID (example)
 IDM_SHOW            EQU 102                       ; Menu item ID: Show (example)
@@ -58,7 +60,7 @@ TIMER_INTERVAL_MS    EQU 1000
 
 extern CreateWindowExA                          ; Import external symbols
 extern GetSystemMetrics
-extern DefWindowProcA                           ; Windows API functions, not decorated
+extern DefWindowProcA
 extern DispatchMessageA
 extern ExitProcess
 extern GetMessageA
@@ -66,32 +68,24 @@ extern GetModuleHandleA
 extern IsDialogMessageA
 extern LoadImageA
 extern PostQuitMessage
-extern PostMessageA
 extern RegisterClassExA
 extern ShowWindow
 extern TranslateMessage
 extern UpdateWindow
 extern BeginPaint
 extern EndPaint
-extern Ellipse
 extern Shell_NotifyIconA
 extern LoadMenuA
 extern GetSubMenu
 extern TrackPopupMenuEx
-extern TrackPopupMenu
 extern SetForegroundWindow
 extern GetCursorPos
 extern DestroyMenu
 extern IsWindowVisible
-extern MoveToEx
-extern LineTo
-extern GetClientRect                            ; ADDED: To get runtime window dimensions
+extern GetClientRect
 extern SetTimer
-extern KillTimer
 extern GetLocalTime
 extern InvalidateRect
-extern DrawTextA
-extern CreatePen
 extern SelectObject
 extern DeleteObject
 extern CreateSolidBrush
@@ -111,6 +105,7 @@ extern GdipCreateSolidFill
 extern GdipDeleteBrush
 extern GdipFillEllipseI
 extern GdipFillRectangleI
+extern GdipSetPenWidth
 
 
 global Start                                    ; Export symbols. The entry point
@@ -128,11 +123,12 @@ section .data                                   ; Initialized data segment
  GdiplusVersion   EQU 1
  UnitPixel        EQU 2
  SmoothingAntiAlias EQU 4
- ; GdiplusStartupInput structure (24 bytes on x64)
+ ; GdiplusStartupInput structure (20 bytes, padded to 24 on x64)
+ align 8
  GdiplusStartupInputData:
   dd GdiplusVersion              ; GdiplusVersion = 1
-  dd 0                           ; padding for pointer alignment
-  dq 0                           ; DebugEventCallback = NULL
+  dd 0                           ; padding for 8-byte alignment
+  dq 0                           ; DebugEventCallback = NULL (aligned)
   dd 0                           ; SuppressBackgroundThread = FALSE
   dd 0                           ; SuppressExternalCodecs = FALSE
  ; Float pen widths for GDI+ (REAL = single-precision float)
@@ -149,6 +145,17 @@ section .data                                   ; Initialized data segment
  kSecHandRatio   dq 0.9     ; SEC_HAND_RATIO_NUM / DEN   (9/10)
  kOneOverTwelve  dq 0.08333333333333333  ; 1/12 for hour-hand interpolation
  kFive           dq 5.0
+
+ ; Reference radius for pen-width scaling (default window 420×440 → radius 190)
+ kRefRadius      dq 190.0
+ ; Base pen widths at reference radius (doubles for SSE2 scaling)
+ ; Hands are 3× the original widths; ticks/border scale proportionally
+ kBaseWBorder    dq 2.0     ; border ring
+ kBaseWMinTick   dq 1.0     ; 60 minute tick marks
+ kBaseWHourTick  dq 3.0     ; 12 hour tick marks
+ kBaseWHour      dq 21.0    ; hour hand   (7 × 3)
+ kBaseWMinute    dq 9.0     ; minute hand (3 × 3)
+ kBaseWSecond    dq 3.0     ; second hand (1 × 3)
 
  ; Precomputed sin/cos lookup table for 60 tick positions
  ; Layout: { sin(i*PI/30), cos(i*PI/30) }  — 16 bytes per entry, 960 bytes total
@@ -661,6 +668,7 @@ WndProc:
     %define hMemDC             RBP - 256   ; memory DC for double-buffering (8 bytes)
     %define hMemBitmap         RBP - 264   ; compatible bitmap (8 bytes)
     %define hOldBitmap         RBP - 272   ; old bitmap to restore (8 bytes)
+    %define PenScale           RBP - 280   ; double: pen width scale factor
 
     ; Save parameters (passed in RCX, RDX, R8, R9)
     mov   qword [RBP + 16], RCX    ; hWnd
@@ -721,9 +729,16 @@ WMPAINT:
     ; =========================================================
     ;  Create off-screen double-buffer (memory DC + bitmap)
     ; =========================================================
+    mov   qword [hMemDC], 0              ; init to NULL for safe cleanup
+    mov   qword [hMemBitmap], 0
+    mov   qword [hOldBitmap], 0
+    mov   qword [hGraphics], 0
+
     sub   RSP, 32
     mov   RCX, qword [hdc]              ; source DC
     call  CreateCompatibleDC
+    test  RAX, RAX
+    jz    .SkipGdipPaint                ; bail on failure
     mov   qword [hMemDC], RAX
     add   RSP, 32
 
@@ -732,6 +747,8 @@ WMPAINT:
     mov   EDX, dword [rect.right]
     mov   R8D, dword [rect.bottom]
     call  CreateCompatibleBitmap
+    test  RAX, RAX
+    jz    .SkipGdipPaint                ; bail on failure
     mov   qword [hMemBitmap], RAX
     add   RSP, 32
 
@@ -753,6 +770,8 @@ WMPAINT:
     cmp   ECX, dword [CenterY]
     cmovg ECX, dword [CenterY]
     sub   ECX, CLOCK_MARGIN         ; margin
+    cmp   ECX, 20                   ; minimum usable radius
+    jl    .SkipGdipPaint            ; window too small, skip drawing
     mov   dword [Radius], ECX
 
     ; =========================================================
@@ -771,6 +790,68 @@ WMPAINT:
     mov   RDX, SmoothingAntiAlias
     call  GdipSetSmoothingMode
     add   RSP, 32
+
+    ; =========================================================
+    ;  Scale all pen widths to match current Radius
+    ;  scale = Radius / 190.0  (reference: default 420×440 window)
+    ; =========================================================
+    cvtsi2sd XMM0, dword [Radius]
+    divsd    XMM0, qword [REL kRefRadius]  ; XMM0 = scale factor
+    movsd    qword [PenScale], XMM0        ; save for reuse
+
+    ; --- gPenBorder ---
+    movsd  XMM0, qword [REL kBaseWBorder]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0                    ; GDI+ wants REAL (float)
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenBorder]
+    call   GdipSetPenWidth
+    add    RSP, 32
+
+    ; --- gPenMinTick ---
+    movsd  XMM0, qword [REL kBaseWMinTick]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenMinTick]
+    call   GdipSetPenWidth
+    add    RSP, 32
+
+    ; --- gPenHourTick ---
+    movsd  XMM0, qword [REL kBaseWHourTick]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenHourTick]
+    call   GdipSetPenWidth
+    add    RSP, 32
+
+    ; --- gPenHour (hour hand, 3× base) ---
+    movsd  XMM0, qword [REL kBaseWHour]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenHour]
+    call   GdipSetPenWidth
+    add    RSP, 32
+
+    ; --- gPenMinute (minute hand, 3× base) ---
+    movsd  XMM0, qword [REL kBaseWMinute]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenMinute]
+    call   GdipSetPenWidth
+    add    RSP, 32
+
+    ; --- gPenSecond (second hand, 3× base) ---
+    movsd  XMM0, qword [REL kBaseWSecond]
+    mulsd  XMM0, qword [PenScale]
+    cvtsd2ss XMM1, XMM0
+    sub    RSP, 32
+    mov    RCX, qword [REL gPenSecond]
+    call   GdipSetPenWidth
+    add    RSP, 32
 
     ; =========================================================
     ;  1. Fill entire background  (dark: 0xFF0D1117)  [cached brush]
@@ -1141,17 +1222,30 @@ WMPAINT:
     add   RSP, 48
 
     ; =========================================================
-    ;  9. Draw center dot  (red filled circle, radius 6)  [cached brush]
+    ;  9. Draw center dot  (diameter = hour hand width + 3px)  [cached brush]
     ; =========================================================
+    ; Compute: diameter = scaledHourWidth + 3, radius = diameter / 2
+    movsd  XMM0, qword [REL kBaseWHour]    ; 21.0
+    mulsd  XMM0, qword [PenScale]          ; scaled hour hand width
+    mov    EAX, 3
+    cvtsi2sd XMM1, EAX
+    addsd  XMM0, XMM1                      ; + 3
+    cvttsd2si ECX, XMM0                    ; ECX = diameter (int)
+    mov    EAX, ECX
+    shr    EAX, 1                           ; EAX = radius (diameter / 2)
+    mov    dword [TickDiv], ECX             ; save diameter
+    mov    dword [TickCount], EAX           ; save radius
+
     sub   RSP, 48
     mov   RCX, qword [hGraphics]
     mov   RDX, qword [REL gBrushCenter]
     mov   R8D, dword [CenterX]
-    sub   R8D, CENTER_DOT_RADIUS
+    sub   R8D, dword [TickCount]
     mov   R9D, dword [CenterY]
-    sub   R9D, CENTER_DOT_RADIUS
-    mov   dword [RSP + 32], CENTER_DOT_RADIUS * 2
-    mov   dword [RSP + 40], CENTER_DOT_RADIUS * 2
+    sub   R9D, dword [TickCount]
+    mov   EAX, dword [TickDiv]
+    mov   dword [RSP + 32], EAX
+    mov   dword [RSP + 40], EAX
     call  GdipFillEllipseI
     add   RSP, 48
 
@@ -1171,6 +1265,9 @@ WMPAINT:
     ; =========================================================
     ;  BitBlt: copy finished off-screen buffer to screen DC
     ; =========================================================
+    mov   RCX, qword [hMemDC]
+    test  RCX, RCX
+    jz    .SkipBlit                       ; no memory DC, skip blit
     sub   RSP, 80                        ; 9 args: 4 in regs + 5 on stack
     mov   RCX, qword [hdc]              ; dest DC (screen)
     xor   EDX, EDX                       ; destX = 0
@@ -1185,25 +1282,37 @@ WMPAINT:
     mov   dword [RSP + 64], SRCCOPY      ; raster op
     call  BitBlt
     add   RSP, 80
+.SkipBlit:
 
     ; =========================================================
     ;  Cleanup: restore old bitmap, delete memory bitmap & DC
+    ;  (null-safe: each handle is checked before use)
     ; =========================================================
+    mov   RCX, qword [hOldBitmap]
+    test  RCX, RCX
+    jz    .SkipRestoreBmp
     sub   RSP, 32
     mov   RCX, qword [hMemDC]
     mov   RDX, qword [hOldBitmap]
     call  SelectObject
     add   RSP, 32
+.SkipRestoreBmp:
 
-    sub   RSP, 32
     mov   RCX, qword [hMemBitmap]
-    call  DeleteObject
-    add   RSP, 32
-
+    test  RCX, RCX
+    jz    .SkipDeleteBmp
     sub   RSP, 32
-    mov   RCX, qword [hMemDC]
     call  DeleteObject
     add   RSP, 32
+.SkipDeleteBmp:
+
+    mov   RCX, qword [hMemDC]
+    test  RCX, RCX
+    jz    .SkipDeleteMemDC
+    sub   RSP, 32
+    call  DeleteObject
+    add   RSP, 32
+.SkipDeleteMemDC:
 
     sub   RSP, 32
     mov   RCX, qword [RBP + 16]
@@ -1218,28 +1327,35 @@ WMPAINT:
 
 WMTRAYICON:                        ; Handler for our tray icon message
     mov   RAX, qword [RBP + 40]    ; RAX = mouse message (lParam)
-    cmp   RAX, WM_LBUTTONDOWN
-    je    .TrayLeftClick
+    cmp   RAX, WM_LBUTTONDBLCLK
+    je    .TrayDblClick
     cmp   RAX, WM_RBUTTONDOWN
     je    .TrayRightClick
     jmp   .TrayUnhandled
 
-.TrayLeftClick:
-    sub   RSP, 32                  ; Shadow space
+.TrayDblClick:
+    ; Toggle visibility: if visible → hide, if hidden → show + foreground
+    sub   RSP, 32
     mov   RCX, qword [RBP + 16]    ; hWnd
     call  IsWindowVisible
     add   RSP, 32
     test  RAX, RAX
-    jnz   .BringToFront            ; If visible, just bring to front
-    ; If not visible, show it
-    sub   RSP, 32                  ; Shadow space
-    mov   RCX, qword [RBP + 16]    ; hWnd
+    jz    .TrayShow                 ; not visible → show it
+    ; Visible → hide it
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]
+    mov   EDX, SW_HIDE
+    call  ShowWindow
+    add   RSP, 32
+    jmp   .TrayHandled
+.TrayShow:
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]
     mov   EDX, SW_SHOWNORMAL
     call  ShowWindow
     add   RSP, 32
-.BringToFront:
-    sub   RSP, 32                  ; Shadow space
-    mov   RCX, qword [RBP + 16]    ; hWnd
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]
     call  SetForegroundWindow
     add   RSP, 32
     jmp   .TrayHandled
