@@ -57,6 +57,13 @@ SEC_HAND_RATIO_DEN   EQU 10
 CENTER_DOT_RADIUS    EQU 6
 TIMER_ID             EQU 1
 TIMER_INTERVAL_MS    EQU 1000
+TRAY_ICON_SIZE       EQU 16
+TRAY_CENTER          EQU 8
+TRAY_FACE_ORIGIN     EQU 1
+TRAY_FACE_DIAM       EQU 14
+TRAY_HAND_HOUR_LEN   EQU 3
+TRAY_HAND_MIN_LEN    EQU 5
+TRAY_HAND_SEC_LEN    EQU 6
 
 extern CreateWindowExA                          ; Import external symbols
 extern GetSystemMetrics
@@ -106,6 +113,12 @@ extern GdipDeleteBrush
 extern GdipFillEllipseI
 extern GdipFillRectangleI
 extern GdipSetPenWidth
+extern GetDC
+extern ReleaseDC
+extern DeleteDC
+extern CreateIconIndirect
+extern DestroyIcon
+extern CreateBitmap
 
 
 global Start                                    ; Export symbols. The entry point
@@ -223,6 +236,10 @@ section .data                                   ; Initialized data segment
   dq -2.07911690817758982e-01, 9.78147600733805689e-01 ; i=58 (348 deg)
   dq -1.04528463267653415e-01, 9.94521895368273290e-01 ; i=59 (354 deg)
 
+ ; Monochrome mask bits for tray icon (16×16, all zeros = fully opaque)
+ align 4
+ TrayMaskBits: times 32 db 0
+
 
 section .bss                                    ; Uninitialized data segment
  alignb 8
@@ -243,6 +260,7 @@ section .bss                                    ; Uninitialized data segment
  gPenHour      resq 1                           ; 0xFFC9D1D9, 7px — hour hand
  gPenMinute    resq 1                           ; 0xFF58A6FF, 3px — minute hand
  gPenSecond    resq 1                           ; 0xFFF85149, 1px — second hand
+ hDynTrayIcon  resq 1                           ; dynamically created tray icon for animation
 
 
 section .text                                   ; Code segment
@@ -636,13 +654,15 @@ WinMain:
 WndProc:
     push  RBP
     mov   RBP, RSP
-    sub   RSP, 320 ; Extended for double-buffer locals (20*16, keeps 16-byte alignment)
+    sub   RSP, 384 ; Extended for double-buffer + tray icon locals (24*16, keeps 16-byte alignment)
 
     ; Stack layout
     %define temp_nid           RBP - 208
     %define temp_nid.cbSize    RBP - 208
     %define temp_nid.hWnd      RBP - 200
     %define temp_nid.uID       RBP - 192
+    %define temp_nid.uFlags    RBP - 188
+    %define temp_nid.hIcon     RBP - 176
     %define ps                 RBP - 120 ; PAINTSTRUCT (72 bytes)
     %define hdc                RBP - 48  ; HDC (8 bytes)
     %define rect               RBP - 144 ; RECT structure (16 bytes)
@@ -669,6 +689,8 @@ WndProc:
     %define hMemBitmap         RBP - 264   ; compatible bitmap (8 bytes)
     %define hOldBitmap         RBP - 272   ; old bitmap to restore (8 bytes)
     %define PenScale           RBP - 280   ; double: pen width scale factor
+    %define hMaskBmp           RBP - 288   ; monochrome mask for tray icon creation (8 bytes)
+    %define TrayIconInfo       RBP - 320   ; ICONINFO structure (32 bytes)
 
     ; Save parameters (passed in RCX, RDX, R8, R9)
     mov   qword [RBP + 16], RCX    ; hWnd
@@ -1448,18 +1470,457 @@ WCOMMANDHANDLER:
     ret
 
 WMTIMER:
+    ; =========================================================
+    ;  Animated tray icon: render a mini analog clock into a
+    ;  16×16 bitmap, convert to icon, and update the system
+    ;  tray via NIM_MODIFY every second.
+    ; =========================================================
 
- sub   RSP, 32
- mov   RCX, qword [RBP + 16]    ; hWnd
- mov   RDX, NULL
- mov   R8, 0                    ; FALSE — no erase; we fill background ourselves
- call  InvalidateRect
- add   RSP, 32
+    ; Initialize handles to NULL for safe cleanup on failure
+    mov   qword [hdc], 0
+    mov   qword [hMemDC], 0
+    mov   qword [hMemBitmap], 0
+    mov   qword [hOldBitmap], 0
+    mov   qword [hGraphics], 0
+    mov   qword [hMaskBmp], 0
 
- xor   EAX, EAX
- mov   RSP, RBP
- pop   RBP
- ret
+    ; 1. Get current system time
+    sub   RSP, 32
+    lea   RCX, [REL SystemTime]
+    call  GetLocalTime
+    add   RSP, 32
+
+    ; 2. Obtain screen DC for bitmap compatibility
+    sub   RSP, 32
+    xor   ECX, ECX                          ; NULL = entire screen
+    call  GetDC
+    test  RAX, RAX
+    jz    .TrayDone
+    mov   qword [hdc], RAX
+    add   RSP, 32
+
+    ; 3. Create memory DC
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    call  CreateCompatibleDC
+    test  RAX, RAX
+    jz    .TrayCleanup
+    mov   qword [hMemDC], RAX
+    add   RSP, 32
+
+    ; 4. Create 16×16 color bitmap
+    sub   RSP, 32
+    mov   RCX, qword [hdc]
+    mov   EDX, TRAY_ICON_SIZE
+    mov   R8D, TRAY_ICON_SIZE
+    call  CreateCompatibleBitmap
+    test  RAX, RAX
+    jz    .TrayCleanup
+    mov   qword [hMemBitmap], RAX
+    add   RSP, 32
+
+    ; 5. Select bitmap into memory DC
+    sub   RSP, 32
+    mov   RCX, qword [hMemDC]
+    mov   RDX, qword [hMemBitmap]
+    call  SelectObject
+    mov   qword [hOldBitmap], RAX
+    add   RSP, 32
+
+    ; 6. Create GDI+ graphics from memory DC
+    sub   RSP, 32
+    mov   RCX, qword [hMemDC]
+    lea   RDX, [hGraphics]
+    call  GdipCreateFromHDC
+    test  EAX, EAX
+    jnz   .TrayCleanup
+    add   RSP, 32
+
+    ; 7. Enable anti-aliasing
+    sub   RSP, 32
+    mov   RCX, qword [hGraphics]
+    mov   RDX, SmoothingAntiAlias
+    call  GdipSetSmoothingMode
+    add   RSP, 32
+
+    ; ---- Draw the mini clock ----
+
+    ; 8. Fill background  (0xFF0D1117)
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gBrushBg]
+    xor   R8D, R8D
+    xor   R9D, R9D
+    mov   dword [RSP + 32], TRAY_ICON_SIZE
+    mov   dword [RSP + 40], TRAY_ICON_SIZE
+    call  GdipFillRectangleI
+    add   RSP, 48
+
+    ; 9. Fill clock face circle  (0xFF161B22)
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gBrushFace]
+    mov   R8D, TRAY_FACE_ORIGIN
+    mov   R9D, TRAY_FACE_ORIGIN
+    mov   dword [RSP + 32], TRAY_FACE_DIAM
+    mov   dword [RSP + 40], TRAY_FACE_DIAM
+    call  GdipFillEllipseI
+    add   RSP, 48
+
+    ; 10. Draw border ring  (1px)
+    sub   RSP, 32
+    mov   RCX, qword [REL gPenBorder]
+    movss XMM1, [REL fPenWidth1]
+    call  GdipSetPenWidth
+    add   RSP, 32
+
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gPenBorder]
+    mov   R8D, TRAY_FACE_ORIGIN
+    mov   R9D, TRAY_FACE_ORIGIN
+    mov   dword [RSP + 32], TRAY_FACE_DIAM
+    mov   dword [RSP + 40], TRAY_FACE_DIAM
+    call  GdipDrawEllipseI
+    add   RSP, 48
+
+    ; Set up center for hand calculations
+    mov   dword [CenterX], TRAY_CENTER
+    mov   dword [CenterY], TRAY_CENTER
+
+    ; ---- 11. Hour hand (length 3px, pen 2px) ----
+    ; Fractional index = (hour%12)*5 + minute/12
+    movzx EAX, word [REL SystemTime + 8]    ; wHour
+    xor   EDX, EDX
+    mov   ECX, 12
+    div   ECX                                ; EDX = hour % 12
+    imul  EDX, 5
+    cvtsi2sd XMM0, EDX
+    movzx EAX, word [REL SystemTime + 10]   ; wMinute
+    cvtsi2sd XMM1, EAX
+    mulsd XMM1, qword [REL kOneOverTwelve]
+    addsd XMM0, XMM1                        ; fractional table index
+
+    ; Floor and fraction
+    cvttsd2si EAX, XMM0
+    cvtsi2sd XMM1, EAX
+    subsd XMM0, XMM1                        ; XMM0 = frac
+
+    ; Ceil index (wrap at 60)
+    mov   ECX, EAX
+    inc   ECX
+    cmp   ECX, 60
+    jl    .TrayHourNoWrap
+    xor   ECX, ECX
+.TrayHourNoWrap:
+
+    ; Interpolate sin/cos from lookup table
+    shl   EAX, 4
+    lea   RDX, [REL TickSinCos]
+    movsd XMM2, qword [RDX + RAX]          ; sin[floor]
+    movsd XMM3, qword [RDX + RAX + 8]      ; cos[floor]
+    shl   ECX, 4
+    movsd XMM4, qword [RDX + RCX]          ; sin[ceil]
+    movsd XMM5, qword [RDX + RCX + 8]      ; cos[ceil]
+
+    subsd XMM4, XMM2
+    mulsd XMM4, XMM0
+    addsd XMM2, XMM4                       ; XMM2 = sin(hour_angle)
+    subsd XMM5, XMM3
+    mulsd XMM5, XMM0
+    addsd XMM3, XMM5                       ; XMM3 = cos(hour_angle)
+
+    ; HandX = CenterX + TRAY_HAND_HOUR_LEN * sin
+    mov   EAX, TRAY_HAND_HOUR_LEN
+    cvtsi2sd XMM4, EAX
+    movsd XMM5, XMM4
+    mulsd XMM4, XMM2
+    cvtsi2sd XMM6, dword [CenterX]
+    addsd XMM4, XMM6
+    cvttsd2si EAX, XMM4
+    mov   dword [HandX], EAX
+
+    ; HandY = CenterY - TRAY_HAND_HOUR_LEN * cos
+    mulsd XMM5, XMM3
+    cvtsi2sd XMM6, dword [CenterY]
+    subsd XMM6, XMM5
+    cvttsd2si EAX, XMM6
+    mov   dword [HandY], EAX
+
+    ; Set hour pen width for tray (2px)
+    sub   RSP, 32
+    mov   RCX, qword [REL gPenHour]
+    movss XMM1, [REL fPenWidth2]
+    call  GdipSetPenWidth
+    add   RSP, 32
+
+    ; Draw hour hand
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gPenHour]
+    mov   R8D, TRAY_CENTER
+    mov   R9D, TRAY_CENTER
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    ; ---- 12. Minute hand (length 5px, pen 1px) ----
+    movzx EAX, word [REL SystemTime + 10]   ; wMinute
+    shl   EAX, 4
+    lea   RCX, [REL TickSinCos]
+    movsd XMM0, qword [RCX + RAX]          ; sin
+    movsd XMM1, qword [RCX + RAX + 8]      ; cos
+
+    mov   EAX, TRAY_HAND_MIN_LEN
+    cvtsi2sd XMM2, EAX
+    movsd XMM3, XMM2
+    mulsd XMM2, XMM0
+    cvtsi2sd XMM4, dword [CenterX]
+    addsd XMM2, XMM4
+    cvttsd2si EAX, XMM2
+    mov   dword [HandX], EAX
+
+    mulsd XMM3, XMM1
+    cvtsi2sd XMM4, dword [CenterY]
+    subsd XMM4, XMM3
+    cvttsd2si EAX, XMM4
+    mov   dword [HandY], EAX
+
+    ; Set minute pen width for tray (1px)
+    sub   RSP, 32
+    mov   RCX, qword [REL gPenMinute]
+    movss XMM1, [REL fPenWidth1]
+    call  GdipSetPenWidth
+    add   RSP, 32
+
+    ; Draw minute hand
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gPenMinute]
+    mov   R8D, TRAY_CENTER
+    mov   R9D, TRAY_CENTER
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    ; ---- 13. Second hand (length 6px, pen 1px) ----
+    movzx EAX, word [REL SystemTime + 12]   ; wSecond
+    shl   EAX, 4
+    lea   RCX, [REL TickSinCos]
+    movsd XMM0, qword [RCX + RAX]          ; sin
+    movsd XMM1, qword [RCX + RAX + 8]      ; cos
+
+    mov   EAX, TRAY_HAND_SEC_LEN
+    cvtsi2sd XMM2, EAX
+    movsd XMM3, XMM2
+    mulsd XMM2, XMM0
+    cvtsi2sd XMM4, dword [CenterX]
+    addsd XMM2, XMM4
+    cvttsd2si EAX, XMM2
+    mov   dword [HandX], EAX
+
+    mulsd XMM3, XMM1
+    cvtsi2sd XMM4, dword [CenterY]
+    subsd XMM4, XMM3
+    cvttsd2si EAX, XMM4
+    mov   dword [HandY], EAX
+
+    ; Set second pen width for tray (1px)
+    sub   RSP, 32
+    mov   RCX, qword [REL gPenSecond]
+    movss XMM1, [REL fPenWidth1]
+    call  GdipSetPenWidth
+    add   RSP, 32
+
+    ; Draw second hand
+    sub   RSP, 48
+    mov   RCX, qword [hGraphics]
+    mov   RDX, qword [REL gPenSecond]
+    mov   R8D, TRAY_CENTER
+    mov   R9D, TRAY_CENTER
+    mov   EAX, dword [HandX]
+    mov   dword [RSP + 32], EAX
+    mov   EAX, dword [HandY]
+    mov   dword [RSP + 40], EAX
+    call  GdipDrawLineI
+    add   RSP, 48
+
+    ; ---- 14. Convert bitmap to icon ----
+
+    ; Delete GDI+ graphics (must release before bitmap extraction)
+    sub   RSP, 32
+    mov   RCX, qword [hGraphics]
+    call  GdipDeleteGraphics
+    add   RSP, 32
+    mov   qword [hGraphics], 0
+
+    ; Deselect bitmap from memory DC
+    sub   RSP, 32
+    mov   RCX, qword [hMemDC]
+    mov   RDX, qword [hOldBitmap]
+    call  SelectObject
+    add   RSP, 32
+    mov   qword [hOldBitmap], 0
+
+    ; Create monochrome mask bitmap (all zeros = fully opaque)
+    sub   RSP, 48
+    mov   ECX, TRAY_ICON_SIZE
+    mov   EDX, TRAY_ICON_SIZE
+    mov   R8D, 1                            ; planes
+    mov   R9D, 1                            ; bits per pixel
+    lea   RAX, [REL TrayMaskBits]
+    mov   qword [RSP + 32], RAX            ; lpBits → all zeros
+    call  CreateBitmap
+    test  RAX, RAX
+    jz    .TrayCleanup
+    mov   qword [hMaskBmp], RAX
+    add   RSP, 48
+
+    ; Fill ICONINFO structure on stack
+    lea   RCX, [TrayIconInfo]
+    mov   dword [RCX], 1                    ; fIcon = TRUE
+    mov   dword [RCX + 4], 0               ; xHotspot
+    mov   dword [RCX + 8], 0               ; yHotspot
+    mov   dword [RCX + 12], 0              ; padding
+    mov   RAX, qword [hMaskBmp]
+    mov   qword [RCX + 16], RAX            ; hbmMask
+    mov   RAX, qword [hMemBitmap]
+    mov   qword [RCX + 24], RAX            ; hbmColor
+
+    ; CreateIconIndirect
+    sub   RSP, 32
+    lea   RCX, [TrayIconInfo]
+    call  CreateIconIndirect
+    test  RAX, RAX
+    jz    .TrayCleanup
+    add   RSP, 32
+
+    ; Save new icon handle temporarily (hGdipBrush slot is safe from nid zeroing)
+    mov   qword [hGdipBrush], RAX
+
+    ; ---- 15. Update tray icon via NIM_MODIFY ----
+    ; Zero temp_nid area (48 bytes covering all fields through hIcon)
+    xor   EAX, EAX
+    mov   qword [RBP - 208], RAX           ; cbSize + pad
+    mov   qword [RBP - 200], RAX           ; hWnd
+    mov   qword [RBP - 192], RAX           ; uID + uFlags
+    mov   qword [RBP - 184], RAX           ; uCallbackMessage + pad
+    mov   qword [RBP - 176], RAX           ; hIcon
+    mov   qword [RBP - 168], RAX           ; szTip[0:7]
+
+    ; Fill required fields
+    mov   dword [temp_nid.cbSize], 168
+    mov   RAX, qword [RBP + 16]            ; hWnd (WndProc argument)
+    mov   qword [temp_nid.hWnd], RAX
+    mov   dword [temp_nid.uID], 0
+    mov   dword [temp_nid.uFlags], NIF_ICON
+    mov   RAX, qword [hGdipBrush]          ; retrieve hNewIcon
+    mov   qword [temp_nid.hIcon], RAX
+
+    sub   RSP, 32
+    mov   ECX, NIM_MODIFY
+    lea   RDX, [temp_nid]
+    call  Shell_NotifyIconA
+    add   RSP, 32
+
+    ; Destroy previous dynamic tray icon (if any)
+    mov   RCX, qword [REL hDynTrayIcon]
+    test  RCX, RCX
+    jz    .TrayNoOldIcon
+    sub   RSP, 32
+    call  DestroyIcon
+    add   RSP, 32
+.TrayNoOldIcon:
+
+    ; Store new icon as current dynamic tray icon
+    mov   RAX, qword [hGdipBrush]          ; hNewIcon
+    mov   qword [REL hDynTrayIcon], RAX
+
+    ; IMPORTANT: temp_nid.hIcon and hGraphics share [RBP-176].
+    ; The icon handle written to temp_nid.hIcon above has overwritten
+    ; hGraphics with a non-zero value.  Clear it so the cleanup below
+    ; does not call GdipDeleteGraphics on an HICON.
+    mov   qword [hGraphics], 0
+
+    ; ---- 16. Cleanup all GDI resources ----
+.TrayCleanup:
+    ; Delete GDI+ graphics (if still alive)
+    mov   RCX, qword [hGraphics]
+    test  RCX, RCX
+    jz    .TraySkipGfx
+    sub   RSP, 32
+    call  GdipDeleteGraphics
+    add   RSP, 32
+.TraySkipGfx:
+
+    ; Restore old bitmap in memory DC
+    mov   RCX, qword [hOldBitmap]
+    test  RCX, RCX
+    jz    .TraySkipRestore
+    sub   RSP, 32
+    mov   RCX, qword [hMemDC]
+    mov   RDX, qword [hOldBitmap]
+    call  SelectObject
+    add   RSP, 32
+.TraySkipRestore:
+
+    ; Delete mask bitmap
+    mov   RCX, qword [hMaskBmp]
+    test  RCX, RCX
+    jz    .TraySkipMask
+    sub   RSP, 32
+    call  DeleteObject
+    add   RSP, 32
+.TraySkipMask:
+
+    ; Delete color bitmap
+    mov   RCX, qword [hMemBitmap]
+    test  RCX, RCX
+    jz    .TraySkipBmp
+    sub   RSP, 32
+    call  DeleteObject
+    add   RSP, 32
+.TraySkipBmp:
+
+    ; Delete memory DC (use DeleteDC, not DeleteObject)
+    mov   RCX, qword [hMemDC]
+    test  RCX, RCX
+    jz    .TraySkipDC
+    sub   RSP, 32
+    call  DeleteDC
+    add   RSP, 32
+.TraySkipDC:
+
+    ; Release screen DC
+    mov   RCX, qword [hdc]
+    test  RCX, RCX
+    jz    .TraySkipScreen
+    sub   RSP, 32
+    xor   ECX, ECX                          ; hWnd = NULL
+    mov   RDX, qword [hdc]
+    call  ReleaseDC
+    add   RSP, 32
+.TraySkipScreen:
+
+.TrayDone:
+    ; Invalidate main window for clock repaint
+    sub   RSP, 32
+    mov   RCX, qword [RBP + 16]            ; hWnd
+    mov   RDX, NULL
+    mov   R8, 0                             ; FALSE — no erase
+    call  InvalidateRect
+    add   RSP, 32
+
+    xor   EAX, EAX
+    mov   RSP, RBP
+    pop   RBP
+    ret
 
 WMERASEBKGND:
     mov   EAX, 1                 ; Return 1 — tell Windows we handled the erase
@@ -1530,6 +1991,15 @@ WMDESTROY:
     call  DestroyMenu
     add   RSP, 32
 .SkipDestroyMenu:
+
+    ; Destroy dynamically created tray icon
+    mov   RCX, qword [REL hDynTrayIcon]
+    test  RCX, RCX
+    jz    .SkipDestroyDynIcon
+    sub   RSP, 32
+    call  DestroyIcon
+    add   RSP, 32
+.SkipDestroyDynIcon:
 
     mov   dword [temp_nid.cbSize], 168
     mov   RAX, qword [RBP + 16]        ; hWnd from WndProc's argument
